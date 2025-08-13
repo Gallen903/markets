@@ -1,15 +1,12 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import date, timedelta
-from io import StringIO
 
-st.set_page_config(page_title="Market Prices", layout="wide")
+st.set_page_config(page_title="Markets Table", layout="wide")
+st.title("Stock Prices Dashboard")
 
-# ----------------------------
-# Full default stock list
-# ----------------------------
-STOCKS = [
+# --- Full stock list ---
+default_stocks = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "SBUX", "name": "Starbucks Corporation", "exchange": "NMS", "currency": "USD"},
@@ -70,136 +67,75 @@ STOCKS = [
     {"ticker": "TSCOL.XC", "name": "TSCOL.XC", "exchange": "CXE", "currency": "GBp"},
 ]
 
-st.title("📊 Market Prices (Clean)")
+# --- Sidebar for manual ticker addition ---
+st.sidebar.header("Add Custom Tickers")
+custom_tickers_input = st.sidebar.text_area(
+    "Enter tickers, one per line in format TICKER,Name,Exchange,Currency",
+    value=""
+)
 
-col1, col2 = st.columns([1, 3])
-with col1:
-    selected_date = st.date_input("Select date", value=date.today())
-run = st.button("Run")
-
-@st.cache_data(show_spinner=False)
-def fetch_history(ticker: str, start_dt: date, end_dt: date) -> pd.DataFrame:
-    """
-    Download OHLC data for ticker in calendar date window [start_dt, end_dt).
-    Returns a DataFrame with a naive DatetimeIndex and 'Close' column.
-    """
-    df = yf.download(
-        ticker,
-        start=start_dt.isoformat(),
-        end=(end_dt + timedelta(days=1)).isoformat(),
-        progress=False,
-        auto_adjust=False,
-        actions=False,
-        interval="1d",
-    )
-    if df.empty:
-        return df
-    # Ensure naive datetime index for comparisons
-    idx = pd.to_datetime(df.index)
-    try:
-        idx = idx.tz_localize(None)
-    except Exception:
-        pass
-    df.index = idx
-    # Keep only rows with numeric close
-    df = df[pd.to_numeric(df.get("Close"), errors="coerce").notna()]
-    return df
-
-def compute_row(stock: dict, target: date):
-    """
-    For a given stock and target date:
-      - Find the closest available trading day <= target.
-      - Compute Close price for that day.
-      - Compute 5-trading-day percentage change if available.
-    Returns dict or None if no price found.
-    """
-    # Pull ~21 calendar days to cover at least 5 trading sessions
-    start_window = target - timedelta(days=28)
-    end_window = target
-    hist = fetch_history(stock["ticker"], start_window, end_window)
-    if hist.empty:
-        return None
-
-    # latest trading day <= target
-    available = hist.index[hist.index <= pd.to_datetime(target)]
-    if len(available) == 0:
-        return None
-    d0 = available[-1]
-    price = float(hist.loc[d0, "Close"])
-
-    # Compute 5-trading-day change (use row position)
-    idx_pos = hist.index.get_loc(d0)
-    if isinstance(idx_pos, slice):
-        # if get_loc returned slice (duplicate index safety) -> take last position of slice
-        idx_pos = range(idx_pos.start, idx_pos.stop)[-1]
-    if idx_pos >= 5:
-        old_price = float(hist.iloc[idx_pos - 5]["Close"])
-        if old_price and old_price != 0:
-            pct_5d = (price / old_price - 1.0) * 100.0
-        else:
-            pct_5d = None
-    else:
-        pct_5d = None
-
-    return {
-        "exchange": stock["exchange"],
-        "currency": stock["currency"],
-        "ticker": stock["ticker"],
-        "name": stock["name"],
-        "date": d0.date().isoformat(),
-        "price": round(price, 2),
-        "5d %": (None if pct_5d is None else round(pct_5d, 1)),
-    }
-
-if run:
-    results = []
-    for s in STOCKS:
+if custom_tickers_input:
+    for line in custom_tickers_input.strip().split("\n"):
         try:
-            row = compute_row(s, selected_date)
-            if row:  # hide tickers with no price
-                results.append(row)
-        except Exception:
-            # Skip noisy tickers silently
-            continue
+            ticker, name, exchange, currency = [x.strip() for x in line.split(",")]
+            default_stocks.append({
+                "ticker": ticker,
+                "name": name,
+                "exchange": exchange,
+                "currency": currency
+            })
+        except:
+            st.sidebar.error(f"Invalid line: {line}")
 
-    if not results:
-        st.warning("No data found for the selected date across your list.")
-    else:
-        df = pd.DataFrame(results)
+# --- Date selection ---
+date_input = st.sidebar.date_input("Select Date")
 
-        # Sort within each exchange by company name
-        df = df.sort_values(by=["exchange", "name"]).reset_index(drop=True)
+# --- Run button ---
+if st.sidebar.button("Run"):
+    date_str = pd.to_datetime(date_input)
+    all_data = []
 
-        # Display grouped sections
-        for (ex, cur), group in df.groupby(["exchange", "currency"], sort=False):
-            st.subheader(f"{ex} ({cur})")
-            show = group[["name", "price", "5d %", "date"]].rename(
-                columns={"name": "Company", "price": "Close", "5d %": "5-day %", "date": "Price date"}
-            )
-            # Format 5-day % as one decimal with % sign for display
-            show["5-day %"] = show["5-day %"].apply(lambda v: ("—" if pd.isna(v) else f"{v:.1f}%"))
-            st.dataframe(show, use_container_width=True)
+    for stock in default_stocks:
+        try:
+            ticker = yf.Ticker(stock["ticker"])
+            hist = ticker.history(period="15d")
+            hist.index = pd.to_datetime(hist.index.date)
 
-        # CSV download of the full underlying data (includes tickers)
-        csv_df = df.copy()
-        # Format 5d % to one decimal in CSV, keep numeric
-        csv_df["5d %"] = csv_df["5d %"].round(1)
-        csv = csv_df[["exchange", "currency", "ticker", "name", "date", "price", "5d %"]].rename(
-            columns={
-                "exchange": "Exchange",
-                "currency": "Currency",
-                "ticker": "Ticker",
-                "name": "Company",
-                "date": "Price Date",
-                "price": "Close",
-                "5d %": "5d_Pct"
-            }
-        ).to_csv(index=False)
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name=f"prices_{selected_date.isoformat()}.csv",
-            mime="text/csv"
-        )
-else:
-    st.info("Pick a date and click **Run** to fetch prices.")
+            if hist.empty:
+                raise ValueError("No data")
+
+            closest_date = hist.index[hist.index <= date_str].max()
+            if pd.isna(closest_date):
+                close_price = None
+                pct_change = None
+            else:
+                close_price = hist.loc[closest_date]["Close"]
+                idx = hist.index.get_loc(closest_date)
+                if idx >= 5:
+                    prev_close = hist.iloc[idx-5]["Close"]
+                    pct_change = (close_price / prev_close - 1) * 100
+                else:
+                    pct_change = None
+
+            all_data.append({
+                "Company": stock["name"],
+                "Exchange": stock["exchange"],
+                "Currency": stock["currency"],
+                "Close": close_price,
+                "5D % Change": pct_change
+            })
+        except:
+            all_data.append({
+                "Company": stock["name"],
+                "Exchange": stock["exchange"],
+                "Currency": stock["currency"],
+                "Close": None,
+                "5D % Change": None
+            })
+
+    df = pd.DataFrame(all_data)
+    df_grouped = df.sort_values(["Exchange", "Company"])
+
+    for exch, group in df_grouped.groupby("Exchange"):
+        st.subheader(f"{exch} ({group['Currency'].iloc[0]})")
+        st.dataframe(group.drop(columns="Exchange").reset_index(drop=True))
