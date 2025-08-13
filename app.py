@@ -139,14 +139,3 @@ if st.sidebar.button("Run"):
     for exch, group in df_grouped.groupby("Exchange"):
         st.subheader(f"{exch} ({group['Currency'].iloc[0]})")
         st.dataframe(group.drop(columns="Exchange").reset_index(drop=True))
-        # CSV download button
-csv_df = df.copy()
-csv_df["5d %"] = csv_df["5d %"].round(1)  # ensure one decimal
-csv = csv_df.to_csv(index=False)
-st.download_button(
-    label="📥 Download CSV",
-    data=csv,
-    file_name=f"prices_{selected_date}.csv",
-    mime="text/csv"
-)
-
