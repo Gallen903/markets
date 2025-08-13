@@ -1,12 +1,12 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
+import pandas as pd
+from datetime import datetime, timedelta
+import json
+import os
 
-st.set_page_config(page_title="Markets Table", layout="wide")
-st.title("Stock Prices Dashboard")
-
-# --- Full stock list ---
-default_stocks = [
+# ==== DEFAULT STOCK LIST ====
+DEFAULT_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "SBUX", "name": "Starbucks Corporation", "exchange": "NMS", "currency": "USD"},
@@ -64,78 +64,86 @@ default_stocks = [
     {"ticker": "HVO.L", "name": "hVIVO plc", "exchange": "LSE", "currency": "GBp"},
     {"ticker": "POLB.L", "name": "Poolbeg Pharma PLC", "exchange": "LSE", "currency": "GBp"},
     {"ticker": "SW", "name": "Smurfit Westrock Plc", "exchange": "NYQ", "currency": "USD"},
-    {"ticker": "TSCOL.XC", "name": "TSCOL.XC", "exchange": "CXE", "currency": "GBp"},
+    {"ticker": "TSCOL.XC", "name": "TSCOL.XC", "exchange": "CXE", "currency": "GBp"}
 ]
 
-# --- Sidebar for manual ticker addition ---
-st.sidebar.header("Add Custom Tickers")
-custom_tickers_input = st.sidebar.text_area(
-    "Enter tickers, one per line in format TICKER,Name,Exchange,Currency",
-    value=""
-)
+# ==== FILE TO STORE CUSTOM DEFAULT LIST ====
+DEFAULT_FILE = "default_stocks.json"
 
-if custom_tickers_input:
-    for line in custom_tickers_input.strip().split("\n"):
+def load_default_stocks():
+    if os.path.exists(DEFAULT_FILE):
+        with open(DEFAULT_FILE, "r") as f:
+            return json.load(f)
+    return DEFAULT_STOCKS
+
+def save_default_stocks(stocks):
+    with open(DEFAULT_FILE, "w") as f:
+        json.dump(stocks, f)
+
+# ==== STREAMLIT UI ====
+st.title("📈 Market Prices Widget")
+
+stocks = load_default_stocks()
+
+# Editable stock list
+st.subheader("Edit Stock List")
+stock_text = st.text_area("Edit as JSON:", json.dumps(stocks, indent=2))
+if st.button("Save as Default List"):
+    try:
+        new_stocks = json.loads(stock_text)
+        save_default_stocks(new_stocks)
+        st.success("✅ Default list updated!")
+    except Exception as e:
+        st.error(f"Error saving list: {e}")
+
+# Date selection
+date_str = st.date_input("Select Date", datetime.today()).strftime("%Y-%m-%d")
+
+if st.button("Run"):
+    tickers = [s["ticker"] for s in stocks]
+    data_rows = []
+    
+    for stock in stocks:
         try:
-            ticker, name, exchange, currency = [x.strip() for x in line.split(",")]
-            default_stocks.append({
-                "ticker": ticker,
-                "name": name,
-                "exchange": exchange,
-                "currency": currency
-            })
-        except:
-            st.sidebar.error(f"Invalid line: {line}")
-
-# --- Date selection ---
-date_input = st.sidebar.date_input("Select Date")
-
-# --- Run button ---
-if st.sidebar.button("Run"):
-    date_str = pd.to_datetime(date_input)
-    all_data = []
-
-    for stock in default_stocks:
-        try:
-            ticker = yf.Ticker(stock["ticker"])
-            hist = ticker.history(period="15d")
-            hist.index = pd.to_datetime(hist.index.date)
-
+            hist = yf.download(stock["ticker"], start=(datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d"), end=(datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
             if hist.empty:
-                raise ValueError("No data")
-
-            closest_date = hist.index[hist.index <= date_str].max()
-            if pd.isna(closest_date):
-                close_price = None
-                pct_change = None
+                data_rows.append({**stock, "Price": "No data", "5d %": "No data"})
+                continue
+            
+            # Get closest date available
+            available_dates = hist.index[hist.index <= pd.to_datetime(date_str)]
+            if available_dates.empty:
+                data_rows.append({**stock, "Price": "No data", "5d %": "No data"})
+                continue
+            
+            price_date = available_dates[-1]
+            price = hist.loc[price_date]["Close"]
+            
+            # 5-day change
+            past_date = price_date - timedelta(days=7)
+            past_dates = hist.index[hist.index <= past_date]
+            if past_dates.empty:
+                change_5d = None
             else:
-                close_price = hist.loc[closest_date]["Close"]
-                idx = hist.index.get_loc(closest_date)
-                if idx >= 5:
-                    prev_close = hist.iloc[idx-5]["Close"]
-                    pct_change = (close_price / prev_close - 1) * 100
-                else:
-                    pct_change = None
-
-            all_data.append({
-                "Company": stock["name"],
-                "Exchange": stock["exchange"],
-                "Currency": stock["currency"],
-                "Close": close_price,
-                "5D % Change": pct_change
+                old_price = hist.loc[past_dates[-1]]["Close"]
+                change_5d = ((price - old_price) / old_price) * 100
+            
+            data_rows.append({
+                **stock,
+                "Price": round(price, 2),
+                "5d %": round(change_5d, 1) if change_5d is not None else "No data"
             })
-        except:
-            all_data.append({
-                "Company": stock["name"],
-                "Exchange": stock["exchange"],
-                "Currency": stock["currency"],
-                "Close": None,
-                "5D % Change": None
-            })
+        except Exception as e:
+            data_rows.append({**stock, "Price": "Error", "5d %": "Error"})
 
-    df = pd.DataFrame(all_data)
-    df_grouped = df.sort_values(["Exchange", "Company"])
+    # Create dataframe grouped by exchange
+    df = pd.DataFrame(data_rows)
+    df_grouped = df.groupby(["exchange", "currency"])
 
-    for exch, group in df_grouped.groupby("Exchange"):
-        st.subheader(f"{exch} ({group['Currency'].iloc[0]})")
-        st.dataframe(group.drop(columns="Exchange").reset_index(drop=True))
+    for (exchange, currency), group in df_grouped:
+        st.subheader(f"{exchange} ({currency})")
+        st.dataframe(group[["name", "Price", "5d %"]])
+
+    # Download CSV
+    csv = df.to_csv(index=False)
+    st.download_button("📥 Download CSV", csv, "prices.csv", "text/csv")
