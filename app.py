@@ -3,10 +3,9 @@ import pandas as pd
 import yfinance as yf
 
 st.set_page_config(page_title="Markets Table", layout="wide")
-
 st.title("Stock Prices Dashboard")
 
-# --- Default stock list ---
+# --- Full stock list ---
 default_stocks = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
@@ -67,8 +66,6 @@ default_stocks = [
     {"ticker": "SW", "name": "Smurfit Westrock Plc", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "TSCOL.XC", "name": "TSCOL.XC", "exchange": "CXE", "currency": "GBp"},
 ]
-    # Add the rest of your stocks here following the same format
-]
 
 # --- Sidebar for manual ticker addition ---
 st.sidebar.header("Add Custom Tickers")
@@ -107,14 +104,12 @@ if st.sidebar.button("Run"):
             if hist.empty:
                 raise ValueError("No data")
 
-            # Closest available trading day
             closest_date = hist.index[hist.index <= date_str].max()
             if pd.isna(closest_date):
                 close_price = None
                 pct_change = None
             else:
                 close_price = hist.loc[closest_date]["Close"]
-
                 idx = hist.index.get_loc(closest_date)
                 if idx >= 5:
                     prev_close = hist.iloc[idx-5]["Close"]
