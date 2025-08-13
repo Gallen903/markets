@@ -1,93 +1,101 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
-import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
-import os
 
-st.title("Stock Prices Viewer")
-
-# --- JSON file to store tickers ---
-TICKERS_FILE = "tickers.json"
-
-# --- Default tickers ---
+# ----------------------------
+# Default ticker list
+# ----------------------------
 default_tickers = [
-    "HEIA.AS", "FDP.AQ", "PDYPY", "GNCL.XC", "GFTUL.XC", "TSCOL.XC",
-    "BSN.F", "GVR.IR", "UPR.IR", "RYA.IR", "PTSB.IR", "OIZ.IR",
-    "MLC.IR", "KRX.IR", "KRZ.IR", "KMR.IR", "IRES.IR", "IR5B.IR",
-    "HSW.IR", "GRP.IR", "GL9.IR", "EG7.IR", "DQ7A.IR", "DHG.IR",
-    "C5H.IR", "A5G.IR", "BIRG.IR", "VOD.L", "DCC.L", "HVO.L",
-    "POLB.L", "ABRONXX", "ICON", "SBUX", "PEP", "META", "MSFT",
-    "INTC", "EBAY", "COKE", "AAPL", "AMGN", "ADI", "GOOG", "STT",
-    "PFE", "ORCL", "NVS", "MRK", "JNJ", "HPQ", "GE", "LLY", "BSX",
-    "ABBV", "ABT", "CRH", "SW"
+    "HEIA.AS","FDP.AQ","FLTRL.NY","GNCL.XC","GFTUL.XC","TSCOL.XC",
+    "BSN.F","GVR.IR","UPR.IR","RYA.IR","PTSB.IR","OIZ.IR",
+    "MLC.IR","KRX.IR","KRZ.IR","KMR.IR","IRES.IR","IR5B.IR",
+    "HSW.IR","GRP.IR","GL9.IR","EG7.IR","DQ7A.IR","DHG.IR",
+    "C5H.IR","A5G.IR","BIRG.IR","VOD.L","DCC.L","HVO.L",
+    "POLB.L","ABRONXX","ICON","SBUX","PEP","META","MSFT",
+    "INTC","EBAY","COKE","AAPL","AMGN","ADI","GOOG","STT",
+    "PFE","ORCL","NVS","MRK","JNJ","HPQ","GE","LLY","BSX",
+    "ABBV","ABT","CRH","SW"
 ]
 
-# --- Load saved tickers or use default ---
-if os.path.exists(TICKERS_FILE):
-    try:
-        with open(TICKERS_FILE, "r") as f:
-            st.session_state.tickers = json.load(f)
-    except Exception:
-        st.session_state.tickers = default_tickers
-else:
-    st.session_state.tickers = default_tickers
+# Load saved tickers if available
+try:
+    with open("tickers.json", "r") as f:
+        saved_tickers = json.load(f)
+        tickers = saved_tickers
+except FileNotFoundError:
+    tickers = default_tickers
 
-# --- Date input ---
-date_input = st.date_input("Select date", datetime.today())
+# ----------------------------
+# Streamlit App Layout
+# ----------------------------
+st.title("Stock Prices & 5-Day Change")
+
+st.subheader("Ticker List (editable)")
+ticker_input = st.text_area("Enter tickers separated by commas:", value=",".join(tickers))
+ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
+
+# Option to save new ticker list
+if st.button("Save as default"):
+    with open("tickers.json", "w") as f:
+        json.dump(ticker_list, f)
+    st.success("Ticker list saved!")
+
+# Date input
+date_input = st.date_input("Select Date", datetime.today())
 date_str = date_input.strftime("%Y-%m-%d")
 
-# --- Editable tickers list ---
-tickers_text = st.text_area(
-    "Enter tickers (comma separated):",
-    value=", ".join(st.session_state.tickers),
-    height=200
-)
+# Run button
+if st.button("Run"):
+    results = []
 
-tickers_list = [t.strip() for t in tickers_text.split(",") if t.strip()]
+    for ticker in ticker_list:
+        stock = yf.Ticker(ticker)
+        
+        # fetch last 7 days to cover holidays/weekends
+        start_date = date_input - timedelta(days=7)
+        end_date = date_input + timedelta(days=1)
+        hist = stock.history(start=start_date, end=end_date)
 
-# --- Save updated tickers to JSON ---
-if st.button("Save as Default"):
-    st.session_state.tickers = tickers_list
-    with open(TICKERS_FILE, "w") as f:
-        json.dump(st.session_state.tickers, f)
-    st.success("Ticker list saved as default!")
-
-# --- Run button ---
-if st.button("Get Prices"):
-    all_data = []
-    for ticker in tickers_list:
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(start=date_str, end=date_str)
-            if hist.empty:
-                st.warning(f"No data for {ticker} on {date_str}")
-                continue
-            close_price = hist['Close'].iloc[0]
-
-            # Calculate 5-day % change
-            hist_5d = stock.history(period="6d")
-            if len(hist_5d) < 6:
-                pct_change_5d = None
-            else:
-                pct_change_5d = (hist_5d['Close'][-1] - hist_5d['Close'][0]) / hist_5d['Close'][0] * 100
-
-            all_data.append({
+        if hist.empty:
+            results.append({
                 "Ticker": ticker,
-                "Name": stock.info.get('shortName', ''),
-                "Exchange": stock.info.get('exchange', ''),
-                "Currency": stock.info.get('currency', ''),
-                "Close": close_price,
-                "5-Day % Change": pct_change_5d
+                "Name": stock.info.get("shortName", ""),
+                "Exchange": stock.info.get("exchange", ""),
+                "Currency": stock.info.get("currency", ""),
+                "Close": "No data",
+                "5d Change (%)": "N/A"
             })
-        except Exception as e:
-            st.error(f"Error fetching {ticker}: {e}")
+            continue
 
-    if all_data:
-        df = pd.DataFrame(all_data)
-        # Group by exchange
-        for exchange, group in df.groupby('Exchange'):
-            currency = group['Currency'].iloc[0] if not group.empty else ""
-            st.subheader(f"{exchange} ({currency})")
-            display_cols = ["Name", "Close", "5-Day % Change"]
-            st.dataframe(group[display_cols].sort_values("Name"))
+        # get the closing price for selected date (or most recent before)
+        available_dates = hist.index[hist.index <= pd.to_datetime(date_str)]
+        last_row = hist.loc[available_dates[-1]]
+        close_price = last_row["Close"]
+
+        # calculate 5-day change
+        if len(available_dates) >= 6:
+            prev_close = hist.loc[available_dates[-6]]["Close"]
+            change_5d = (close_price - prev_close) / prev_close * 100
+            change_5d = round(change_5d, 2)
+        else:
+            change_5d = "N/A"
+
+        results.append({
+            "Ticker": ticker,
+            "Name": stock.info.get("shortName", ""),
+            "Exchange": stock.info.get("exchange", ""),
+            "Currency": stock.info.get("currency", ""),
+            "Close": close_price,
+            "5d Change (%)": change_5d
+        })
+
+    df = pd.DataFrame(results)
+
+    # Group by Exchange
+    grouped = df.groupby("Exchange")
+    for ex, group in grouped:
+        currency = group["Currency"].iloc[0] if not group.empty else ""
+        st.subheader(f"{ex} ({currency})")
+        st.dataframe(group.drop(columns=["Exchange","Currency","Ticker"]))
