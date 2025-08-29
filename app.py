@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+from datetime import datetime, timedelta
 
-# --- Default stock list (your full list preserved) ---
+# --- Default stock list (same as before) ---
 DEFAULT_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
@@ -65,65 +66,62 @@ DEFAULT_STOCKS = [
 
 # --- Streamlit UI ---
 st.title("📈 Stock Prices Dashboard")
-st.write("Select a date to view stock prices, 5-day % change, and year-to-date % change.")
+st.write("View stock prices with 5-day % change and year-to-date % change.")
 
 date_str = st.date_input("Select date")
 
-# --- Run button ---
+# Run button
 if st.button("Run"):
     rows = []
     for stock in DEFAULT_STOCKS:
         ticker = stock["ticker"]
-        data = yf.Ticker(ticker)
-
         try:
-            # Fetch historical data for the year
-            hist = data.history(start=f"{date_str.year}-01-01", end=pd.to_datetime(date_str) + pd.Timedelta(days=1))
+            data = yf.download(ticker, start=f"{date_str.year}-01-01", end=date_str + timedelta(days=1))
 
-            if hist.empty:
+            if data.empty:
                 continue
 
-            # Get price closest to selected date
-            date_idx = hist.index[hist.index <= pd.to_datetime(date_str)]
-            if len(date_idx) == 0:
+            # Find last available trading day on or before selected date
+            valid_dates = data.index[data.index <= pd.to_datetime(date_str)]
+            if len(valid_dates) == 0:
                 continue
-            price = hist.loc[date_idx[-1], "Close"]
+            sel_date = valid_dates[-1]
+            price = data.loc[sel_date, "Close"]
 
             # 5-day % change
-            past_idx = hist.index[hist.index <= pd.to_datetime(date_str) - pd.Timedelta(days=5)]
-            if len(past_idx) > 0:
-                past_price = hist.loc[past_idx[-1], "Close"]
+            past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
+            if len(past_dates) > 0:
+                past_price = data.loc[past_dates[-1], "Close"]
                 change_5d = (price - past_price) / past_price * 100
             else:
                 change_5d = None
 
-            # Year-to-date % change
-            ytd_price = hist.iloc[0]["Close"]
+            # YTD % change
+            ytd_price = data.iloc[0]["Close"]
             change_ytd = (price - ytd_price) / ytd_price * 100
 
             rows.append({
                 "Company": stock["name"],
                 "Exchange": f"{stock['exchange']} ({stock['currency']})",
-                "Price": round(price, 2),
+                "Price": round(price, 1),
                 "5D % Change": round(change_5d, 1) if change_5d is not None else None,
                 "YTD % Change": round(change_ytd, 1),
             })
+
         except Exception:
             continue
 
     if rows:
-        df = pd.DataFrame(rows)
-        df = df.sort_values(by=["Exchange", "Company"])
-
+        df = pd.DataFrame(rows).sort_values(by=["Exchange", "Company"])
         st.dataframe(df, use_container_width=True)
 
-        # --- CSV Download Button ---
+        # CSV Download
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="💾 Download as CSV",
+            label="💾 Download CSV",
             data=csv,
             file_name="stock_prices.csv",
             mime="text/csv",
         )
     else:
-        st.warning("No data available for the selected date.")
+        st.warning("No stock data available for that date.")
