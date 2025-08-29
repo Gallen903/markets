@@ -2,11 +2,8 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 
-st.set_page_config(page_title="Markets Table", layout="wide")
-st.title("Stock Prices Dashboard")
-
-# --- Full stock list ---
-default_stocks = [
+# --- Default stock list (your full list preserved) ---
+DEFAULT_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "SBUX", "name": "Starbucks Corporation", "exchange": "NMS", "currency": "USD"},
@@ -31,7 +28,6 @@ default_stocks = [
     {"ticker": "AAPL", "name": "Apple Inc.", "exchange": "NMS", "currency": "USD"},
     {"ticker": "AMGN", "name": "Amgen Inc.", "exchange": "NMS", "currency": "USD"},
     {"ticker": "ADI", "name": "Analog Devices, Inc.", "exchange": "NMS", "currency": "USD"},
-    {"ticker": "ABRONXX", "name": "HSBC USA Inc. Dual Directional Barrier Note ABRONXX", "exchange": "NAS", "currency": "USD"},
     {"ticker": "ABBV", "name": "AbbVie Inc.", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "GVR.IR", "name": "Glenveagh Properties PLC", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "GOOG", "name": "Alphabet Inc.", "exchange": "NMS", "currency": "USD"},
@@ -58,84 +54,76 @@ default_stocks = [
     {"ticker": "A5G.IR", "name": "AIB Group plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "BIRG.IR", "name": "Bank of Ireland Group plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "DCC.L", "name": "DCC plc", "exchange": "LSE", "currency": "GBp"},
-    {"ticker": "FLTRL.XC", "name": "Flutter Entertainment plc", "exchange": "NYS", "currency": "GBp"},
-    {"ticker": "GNCL.XC", "name": "Greencore Group plc", "exchange": "CXE", "currency": "GBp"},
-    {"ticker": "GFTUL.XC", "name": "Grafton Group plc", "exchange": "CXE", "currency": "GBp"},
+    {"ticker": "FLUT", "name": "Flutter Entertainment plc", "exchange": "NYQ", "currency": "USD"},
+    {"ticker": "GNCL.L", "name": "Greencore Group plc", "exchange": "LSE", "currency": "GBp"},
+    {"ticker": "GFTU.L", "name": "Grafton Group plc", "exchange": "LSE", "currency": "GBp"},
     {"ticker": "HVO.L", "name": "hVIVO plc", "exchange": "LSE", "currency": "GBp"},
     {"ticker": "POLB.L", "name": "Poolbeg Pharma PLC", "exchange": "LSE", "currency": "GBp"},
     {"ticker": "SW", "name": "Smurfit Westrock Plc", "exchange": "NYQ", "currency": "USD"},
-    {"ticker": "TSCOL.XC", "name": "TSCOL.XC", "exchange": "CXE", "currency": "GBp"},
+    {"ticker": "TSCO.L", "name": "Tesco PLC", "exchange": "LSE", "currency": "GBp"},
 ]
 
-# --- Sidebar for manual ticker addition ---
-st.sidebar.header("Add Custom Tickers")
-custom_tickers_input = st.sidebar.text_area(
-    "Enter tickers, one per line in format TICKER,Name,Exchange,Currency",
-    value=""
-)
+# --- Streamlit UI ---
+st.title("📈 Stock Prices Dashboard")
+st.write("Select a date to view stock prices, 5-day % change, and year-to-date % change.")
 
-if custom_tickers_input:
-    for line in custom_tickers_input.strip().split("\n"):
-        try:
-            ticker, name, exchange, currency = [x.strip() for x in line.split(",")]
-            default_stocks.append({
-                "ticker": ticker,
-                "name": name,
-                "exchange": exchange,
-                "currency": currency
-            })
-        except:
-            st.sidebar.error(f"Invalid line: {line}")
-
-# --- Date selection ---
-date_input = st.sidebar.date_input("Select Date")
+date_str = st.date_input("Select date")
 
 # --- Run button ---
-if st.sidebar.button("Run"):
-    date_str = pd.to_datetime(date_input)
-    all_data = []
+if st.button("Run"):
+    rows = []
+    for stock in DEFAULT_STOCKS:
+        ticker = stock["ticker"]
+        data = yf.Ticker(ticker)
 
-    for stock in default_stocks:
         try:
-            ticker = yf.Ticker(stock["ticker"])
-            hist = ticker.history(period="15d")
-            hist.index = pd.to_datetime(hist.index.date)
+            # Fetch historical data for the year
+            hist = data.history(start=f"{date_str.year}-01-01", end=pd.to_datetime(date_str) + pd.Timedelta(days=1))
 
             if hist.empty:
-                raise ValueError("No data")
+                continue
 
-            closest_date = hist.index[hist.index <= date_str].max()
-            if pd.isna(closest_date):
-                close_price = None
-                pct_change = None
+            # Get price closest to selected date
+            date_idx = hist.index[hist.index <= pd.to_datetime(date_str)]
+            if len(date_idx) == 0:
+                continue
+            price = hist.loc[date_idx[-1], "Close"]
+
+            # 5-day % change
+            past_idx = hist.index[hist.index <= pd.to_datetime(date_str) - pd.Timedelta(days=5)]
+            if len(past_idx) > 0:
+                past_price = hist.loc[past_idx[-1], "Close"]
+                change_5d = (price - past_price) / past_price * 100
             else:
-                close_price = hist.loc[closest_date]["Close"]
-                idx = hist.index.get_loc(closest_date)
-                if idx >= 5:
-                    prev_close = hist.iloc[idx-5]["Close"]
-                    pct_change = (close_price / prev_close - 1) * 100
-                else:
-                    pct_change = None
+                change_5d = None
 
-            all_data.append({
+            # Year-to-date % change
+            ytd_price = hist.iloc[0]["Close"]
+            change_ytd = (price - ytd_price) / ytd_price * 100
+
+            rows.append({
                 "Company": stock["name"],
-                "Exchange": stock["exchange"],
-                "Currency": stock["currency"],
-                "Close": close_price,
-                "5D % Change": pct_change
+                "Exchange": f"{stock['exchange']} ({stock['currency']})",
+                "Price": round(price, 2),
+                "5D % Change": round(change_5d, 1) if change_5d is not None else None,
+                "YTD % Change": round(change_ytd, 1),
             })
-        except:
-            all_data.append({
-                "Company": stock["name"],
-                "Exchange": stock["exchange"],
-                "Currency": stock["currency"],
-                "Close": None,
-                "5D % Change": None
-            })
+        except Exception:
+            continue
 
-    df = pd.DataFrame(all_data)
-    df_grouped = df.sort_values(["Exchange", "Company"])
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df.sort_values(by=["Exchange", "Company"])
 
-    for exch, group in df_grouped.groupby("Exchange"):
-        st.subheader(f"{exch} ({group['Currency'].iloc[0]})")
-        st.dataframe(group.drop(columns="Exchange").reset_index(drop=True))
+        st.dataframe(df, use_container_width=True)
+
+        # --- CSV Download Button ---
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="💾 Download as CSV",
+            data=csv,
+            file_name="stock_prices.csv",
+            mime="text/csv",
+        )
+    else:
+        st.warning("No data available for the selected date.")
