@@ -46,4 +46,94 @@ MASTER_STOCKS = [
     {"ticker": "KMR.IR", "name": "Kenmare Resources plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "IRES.IR", "name": "Irish Residential Properties REIT Plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "IR5B.IR", "name": "Irish Continental Group plc", "exchange": "ISE", "currency": "EUR"},
-    {"ticker": "H
+    {"ticker": "HSW.IR", "name": "Hostelworld Group plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "GRP.IR", "name": "Greencoat Renewables", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "GL9.IR", "name": "Glanbia plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "EG7.IR", "name": "FBD Holdings plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "DQ7A.IR", "name": "Donegal Investment Group plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "DHG.IR", "name": "Dalata Hotel Group plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "C5H.IR", "name": "Cairn Homes plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "A5G.IR", "name": "AIB Group plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "BIRG.IR", "name": "Bank of Ireland Group plc", "exchange": "ISE", "currency": "EUR"},
+    {"ticker": "DCC.L", "name": "DCC plc", "exchange": "LSE", "currency": "GBp"},
+    {"ticker": "FLTRL.XC", "name": "Flutter Entertainment plc", "exchange": "NYS", "currency": "GBp"},  # NY listing
+    {"ticker": "GNCL.XC", "name": "Greencore Group plc", "exchange": "CXE", "currency": "GBp"},
+    {"ticker": "GFTUL.XC", "name": "Grafton Group plc", "exchange": "CXE", "currency": "GBp"},
+    {"ticker": "HVO.L", "name": "hVIVO plc", "exchange": "LSE", "currency": "GBp"},
+    {"ticker": "POLB.L", "name": "Poolbeg Pharma PLC", "exchange": "LSE", "currency": "GBp"},
+    {"ticker": "SW", "name": "Smurfit Westrock Plc", "exchange": "NYQ", "currency": "USD"},
+    {"ticker": "TSCOL.XC", "name": "Tesco plc", "exchange": "CXE", "currency": "GBp"},
+]
+
+# --- Streamlit UI ---
+st.title("📊 Stock Dashboard")
+st.write("View stock prices with 5-day % change and year-to-date % change.")
+
+date_str = st.date_input("Select date")
+
+# Editable stock list
+stock_options = {f"{s['name']} ({s['ticker']})": s for s in MASTER_STOCKS}
+selected_labels = st.multiselect("Select stocks to include:", list(stock_options.keys()), default=list(stock_options.keys()))
+SELECTED_STOCKS = [stock_options[label] for label in selected_labels]
+
+if st.button("Run"):
+    rows = []
+    for stock in SELECTED_STOCKS:
+        ticker = stock["ticker"]
+        try:
+            data = yf.download(ticker, start=f"{date_str.year}-01-01", end=date_str + timedelta(days=1), progress=False)
+
+            if data.empty:
+                continue
+
+            # --- Pick last available trading day <= selected ---
+            sel_date = data.index[data.index <= pd.to_datetime(date_str)].max()
+            if pd.isna(sel_date):
+                continue
+
+            price = float(data.loc[sel_date, "Close"])
+
+            # 5-day % change
+            past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
+            change_5d = None
+            if len(past_dates) > 0:
+                past_price = float(data.loc[past_dates[-1], "Close"])
+                change_5d = (price - past_price) / past_price * 100
+
+            # YTD % change
+            ytd_price = float(data.iloc[0]["Close"])
+            change_ytd = (price - ytd_price) / ytd_price * 100
+
+            rows.append({
+                "Company": stock["name"],
+                "Exchange": stock["exchange"],
+                "Currency": stock["currency"],
+                "Price": round(price, 1),
+                "5D % Change": round(change_5d, 1) if change_5d is not None else None,
+                "YTD % Change": round(change_ytd, 1),
+            })
+        except Exception:
+            continue
+
+    if rows:
+        df = pd.DataFrame(rows).sort_values(by=["Exchange", "Company"])
+        grouped = df.groupby(["Exchange", "Currency"])
+
+        # Display grouped data
+        for (exchange, currency), gdf in grouped:
+            st.subheader(f"{exchange} ({currency})")
+            st.dataframe(gdf.drop(columns=["Exchange", "Currency"]), use_container_width=True)
+
+        # --- CSV download (clean, formatted by exchange) ---
+        output_lines = []
+        for (exchange, currency), gdf in grouped:
+            output_lines.append(f"{exchange} ({currency})")
+            for _, row in gdf.drop(columns=["Exchange", "Currency"]).iterrows():
+                output_lines.append(
+                    f"{row['Company']},{row['Price']},{row['5D % Change']},{row['YTD % Change']}"
+                )
+
+        csv = "\n".join(output_lines).encode("utf-8")
+        st.download_button("💾 Download CSV", csv, "stock_data.csv", "text/csv")
+    else:
+        st.warning("No stock data available for that date.")
