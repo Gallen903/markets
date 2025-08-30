@@ -104,3 +104,47 @@ if st.button("Run"):
     for stock in SELECTED_STOCKS:
         ticker = stock["ticker"]
         try:
+            data = yf.download(ticker, start=f"{date_str.year}-01-01", end=date_str + timedelta(days=1), progress=False)
+            if data.empty:
+                continue
+            valid_dates = data.index[data.index <= pd.to_datetime(date_str)]
+            if len(valid_dates) == 0:
+                continue
+            sel_date = valid_dates[-1]
+            price = float(data.loc[sel_date, "Close"])
+            past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
+            change_5d = None
+            if len(past_dates) > 0:
+                past_price = float(data.loc[past_dates[-1], "Close"])
+                change_5d = (price - past_price) / past_price * 100
+            ytd_price = float(data.iloc[0]["Close"])
+            change_ytd = (price - ytd_price) / ytd_price * 100
+            rows.append({
+                "Company": stock["name"],
+                "Exchange": stock["exchange"],
+                "Region": get_region(stock["exchange"]),
+                "Price": round(price, 1),
+                "5D % Change": round(change_5d, 1) if change_5d is not None else None,
+                "YTD % Change": round(change_ytd, 1),
+            })
+        except Exception:
+            continue
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df[df["Price"].notnull()]  # hide rows with no price
+        # Display by region
+        for region, gdf in df.groupby("Region"):
+            st.subheader(region)
+            st.dataframe(gdf.sort_values("Company")[["Company","Price","5D % Change","YTD % Change"]], use_container_width=True)
+
+        # --- CSV Export ---
+        csv_lines = []
+        for region, gdf in df.groupby("Region"):
+            csv_lines.append(region)
+            for _, row in gdf.sort_values("Company").iterrows():
+                csv_lines.append(f"{row['Company']},{row['Price']},{row['5D % Change']},{row['YTD % Change']}")
+        csv_content = "\n".join(csv_lines).encode("utf-8")
+        st.download_button("💾 Download CSV", csv_content, "stock_data.csv", "text/csv")
+    else:
+        st.warning("No stock data available for that date.")
