@@ -3,7 +3,22 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 
-# --- Full Stock Master List (all from your messages) ---
+# --- Exchange to Region Mapping ---
+EXCHANGE_REGION = {
+    "NYQ": "US",
+    "NMS": "US",
+    "NYS": "US",
+    "NCM": "US",
+    "CXE": "UK",
+    "LSE": "UK",
+    "AQS": "UK",
+    "ISE": "Ireland",
+    "AMS": "Europe",
+    "FRA": "Europe",
+    "BME": "Europe",
+}
+
+# --- Full Stock Master List ---
 MASTER_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "exchange": "NYQ", "currency": "USD"},
@@ -29,7 +44,6 @@ MASTER_STOCKS = [
     {"ticker": "AAPL", "name": "Apple Inc.", "exchange": "NMS", "currency": "USD"},
     {"ticker": "AMGN", "name": "Amgen Inc.", "exchange": "NMS", "currency": "USD"},
     {"ticker": "ADI", "name": "Analog Devices, Inc.", "exchange": "NMS", "currency": "USD"},
-    {"ticker": "ABRONXX", "name": "HSBC USA Inc. Dual Directional Barrier Note ABRONXX", "exchange": "NAS", "currency": "USD"},
     {"ticker": "ABBV", "name": "AbbVie Inc.", "exchange": "NYQ", "currency": "USD"},
     {"ticker": "GVR.IR", "name": "Glenveagh Properties PLC", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "GOOG", "name": "Alphabet Inc.", "exchange": "NMS", "currency": "USD"},
@@ -56,7 +70,7 @@ MASTER_STOCKS = [
     {"ticker": "A5G.IR", "name": "AIB Group plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "BIRG.IR", "name": "Bank of Ireland Group plc", "exchange": "ISE", "currency": "EUR"},
     {"ticker": "DCC.L", "name": "DCC plc", "exchange": "LSE", "currency": "GBp"},
-    {"ticker": "FLTRL.XC", "name": "Flutter Entertainment plc", "exchange": "NYS", "currency": "GBp"},
+    {"ticker": "FLUT", "name": "Flutter Entertainment plc", "exchange": "NYQ", "currency": "USD"},  # updated to NY
     {"ticker": "GNCL.XC", "name": "Greencore Group plc", "exchange": "CXE", "currency": "GBp"},
     {"ticker": "GFTUL.XC", "name": "Grafton Group plc", "exchange": "CXE", "currency": "GBp"},
     {"ticker": "HVO.L", "name": "hVIVO plc", "exchange": "LSE", "currency": "GBp"},
@@ -95,26 +109,24 @@ if st.button("Run"):
             if data.empty:
                 continue
 
-            # Last available date <= selected
             valid_dates = data.index[data.index <= pd.to_datetime(date_str)]
             if len(valid_dates) == 0:
                 continue
             sel_date = valid_dates[-1]
 
             price = float(data.loc[sel_date, "Close"])
-            # 5-day % change
             past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
             change_5d = None
             if len(past_dates) > 0:
                 past_price = float(data.loc[past_dates[-1], "Close"])
                 change_5d = (price - past_price) / past_price * 100
 
-            # YTD % change
             ytd_price = float(data.iloc[0]["Close"])
             change_ytd = (price - ytd_price) / ytd_price * 100
 
             rows.append({
                 "Company": stock["name"],
+                "Region": EXCHANGE_REGION.get(stock["exchange"], "Other"),
                 "Exchange": stock["exchange"],
                 "Currency": stock["currency"],
                 "Price": round(price, 1),
@@ -125,23 +137,24 @@ if st.button("Run"):
             continue
 
     if rows:
-        df = pd.DataFrame(rows).sort_values(by=["Exchange", "Company"])
-        grouped = df.groupby(["Exchange", "Currency"])
+        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"])
+        grouped = df.groupby(["Region", "Currency"])
 
-        for (exchange, currency), gdf in grouped:
-            st.subheader(f"{exchange} ({currency})")
-            st.dataframe(gdf.drop(columns=["Exchange", "Currency"]), use_container_width=True)
+        for (region, currency), gdf in grouped:
+            st.subheader(f"{region} ({currency})")
+            st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
 
-        # --- Format CSV to match on-screen display ---
+        # --- CSV Output by Region ---
         output_lines = []
-        for (exchange, currency), gdf in grouped:
-            output_lines.append(f"{exchange} ({currency})")
+        for (region, currency), gdf in grouped:
+            output_lines.append(f"{region} ({currency})")
             output_lines.append("Company,Price,5D % Change,YTD % Change")
-            for _, row in gdf.drop(columns=["Exchange", "Currency"]).iterrows():
-                output_lines.append(
-                    f"{row['Company']},{row['Price']},{row['5D % Change']},{row['YTD % Change']}"
-                )
-            output_lines.append("")  # blank line between groups
+            for _, row in gdf.drop(columns=["Region", "Currency"]).iterrows():
+                p = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
+                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
+                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
+                output_lines.append(f"{row['Company']},{p},{c5},{cy}")
+            output_lines.append("")
 
         csv = "\n".join(output_lines).encode("utf-8")
         st.download_button("💾 Download CSV", csv, "stock_data.csv", "text/csv")
