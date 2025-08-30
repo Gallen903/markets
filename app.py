@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
+import io
+import csv
 
 # --- Full Stock Master List ---
 MASTER_STOCKS = [
@@ -35,11 +37,8 @@ MASTER_STOCKS = [
     {"ticker": "AER", "name": "AerCap Holdings", "region": "US", "currency": "USD"},
     {"ticker": "FLUT", "name": "Flutter Entertainment plc", "region": "US", "currency": "USD"},  # NY listing
 
-    # Europe
     {"ticker": "HEIA.AS", "name": "Heineken N.V.", "region": "Europe", "currency": "EUR"},
     {"ticker": "BSN.F", "name": "Danone S.A.", "region": "Europe", "currency": "EUR"},
-
-    # UK (London stocks)
     {"ticker": "VOD.L", "name": "Vodafone Group", "region": "UK", "currency": "GBp"},
     {"ticker": "DCC.L", "name": "DCC plc", "region": "UK", "currency": "GBp"},
     {"ticker": "GNCL.XC", "name": "Greencore Group plc", "region": "UK", "currency": "GBp"},
@@ -49,10 +48,10 @@ MASTER_STOCKS = [
     {"ticker": "TSCOL.XC", "name": "Tesco plc", "region": "UK", "currency": "GBp"},
     {"ticker": "BRBY.L", "name": "Burberry", "region": "UK", "currency": "GBp"},
     {"ticker": "SSPG.L", "name": "SSP Group", "region": "UK", "currency": "GBp"},
+    {"ticker": "BKT.MC", "name": "Bankinter", "region": "Europe", "currency": "EUR"},
     {"ticker": "ABF.L", "name": "Associated British Foods", "region": "UK", "currency": "GBp"},
     {"ticker": "GWMO.L", "name": "Great Western Mining Corp", "region": "UK", "currency": "GBp"},
 
-    # Ireland
     {"ticker": "GVR.IR", "name": "Glenveagh Properties PLC", "region": "Ireland", "currency": "EUR"},
     {"ticker": "UPR.IR", "name": "Uniphar plc", "region": "Ireland", "currency": "EUR"},
     {"ticker": "RYA.IR", "name": "Ryanair Holdings plc", "region": "Ireland", "currency": "EUR"},
@@ -107,12 +106,14 @@ if st.button("Run"):
 
             price = float(data.loc[sel_date, "Close"])
 
+            # 5-day % change
             past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
             change_5d = None
             if len(past_dates) > 0:
                 past_price = float(data.loc[past_dates[-1], "Close"])
                 change_5d = (price - past_price) / past_price * 100
 
+            # YTD % change
             ytd_price = float(data.iloc[0]["Close"])
             change_ytd = (price - ytd_price) / ytd_price * 100
 
@@ -128,19 +129,13 @@ if st.button("Run"):
             continue
 
     if rows:
-        df = pd.DataFrame(rows)
-        df.loc[df['Currency'] == 'GBp', 'Region'] = 'UK'
-        df['Region'] = pd.Categorical(df['Region'], categories=["Ireland", "UK", "Europe", "US"], ordered=True)
-        df = df.sort_values(by=['Region', 'Company'])
-        grouped = df.groupby(['Region', 'Currency'])
+        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"])
+        grouped = df.groupby(["Region", "Currency"])
 
         # Display in Streamlit
-        for region in ["Ireland", "UK", "Europe", "US"]:
-            for (r, currency), gdf in grouped:
-                if r != region:
-                    continue
-                st.subheader(f"{region} ({currency})")
-                st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
+        for (region, currency), gdf in grouped:
+            st.subheader(f"{region} ({currency})")
+            st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
 
         # --- CSV Output ---
         REGION_LABELS = {
@@ -150,20 +145,24 @@ if st.button("Run"):
             "US": "US ($)"
         }
 
-        output_lines = []
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
         for region in ["Ireland", "UK", "Europe", "US"]:
             for (r, currency), gdf in grouped:
                 if r != region:
                     continue
-                output_lines.append(f"{REGION_LABELS[r]},Last price,5D %change,YTD % change")
+                # Write region header
+                writer.writerow([REGION_LABELS[r], "Last price", "5D %change", "YTD % change"])
+                # Write stock rows
                 for _, row in gdf.iterrows():
-                    company = row['Company']
-                    p = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
+                    company = row['Company'].replace('"', '')  # remove any quotes
+                    price = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
                     c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
                     cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
-                    output_lines.append(f"{company},{p},{c5},{cy}")
+                    writer.writerow([company, price, c5, cy])
 
-        csv = "\n".join(output_lines).encode("utf-8")
-        st.download_button("💾 Download CSV", csv, "stock_data.csv", "text/csv")
+        csv_bytes = '\ufeff' + output.getvalue()  # UTF-8 BOM for Excel
+        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
     else:
         st.warning("No stock data available for that date.")
