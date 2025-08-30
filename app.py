@@ -33,7 +33,7 @@ MASTER_STOCKS = [
     {"ticker": "SW", "name": "Smurfit Westrock Plc", "region": "US", "currency": "USD"},
     {"ticker": "DEO", "name": "Diageo", "region": "US", "currency": "USD"},
     {"ticker": "AER", "name": "AerCap Holdings", "region": "US", "currency": "USD"},
-    {"ticker": "FLUT", "name": "Flutter Entertainment plc", "region": "US", "currency": "USD"},  # Updated to NY listing
+    {"ticker": "FLUT", "name": "Flutter Entertainment plc", "region": "US", "currency": "USD"},  # NY listing
 
     {"ticker": "HEIA.AS", "name": "Heineken N.V.", "region": "Europe", "currency": "EUR"},
     {"ticker": "BSN.F", "name": "Danone S.A.", "region": "Europe", "currency": "EUR"},
@@ -128,24 +128,34 @@ if st.button("Run"):
             continue
 
     if rows:
-        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"])
-        grouped = df.groupby(["Region", "Currency"])
+        df = pd.DataFrame(rows)
 
-        # Display in Streamlit
+        # --- Region ordering ---
+        REGION_ORDER = ["Ireland", "UK", "Europe", "US"]
+        df['Region'] = pd.Categorical(df['Region'], categories=REGION_ORDER, ordered=True)
+        df = df.sort_values(by=['Region', 'Company'])
+        grouped = df.groupby(['Region', 'Currency'])
+
+        # --- Streamlit display ---
         for (region, currency), gdf in grouped:
             st.subheader(f"{region} ({currency})")
             st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
 
-        # --- Clean CSV Output ---
-        output_lines = ["Company,Price,5D % Change,YTD % Change"]
-        for (region, currency), gdf in grouped:
-            output_lines.append(f"{region} ({currency})")
-            for _, row in gdf.drop(columns=["Region", "Currency"]).iterrows():
-                company = f"\"{row['Company']}\""  # quotes handle commas
-                p = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
-                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
-                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
-                output_lines.append(f"{company},{p},{c5},{cy}")
+        # --- CSV Output ---
+        REGION_LABELS = {"Ireland": "Ireland (€)", "UK": "UK (£)", "Europe": "Europe (€)", "US": "US ($)"}
+        output_lines = []
+
+        for region in REGION_ORDER:
+            for (r, currency), gdf in grouped:
+                if r != region:
+                    continue
+                output_lines.append(f"{REGION_LABELS[r]}\tLast price\t5D %change\tYTD % change")
+                for _, row in gdf.iterrows():
+                    company = f"{row['Company']}"
+                    p = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
+                    c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
+                    cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
+                    output_lines.append(f"{company}\t{p}\t{c5}\t{cy}")
 
         csv = "\n".join(output_lines).encode("utf-8")
         st.download_button("💾 Download CSV", csv, "stock_data.csv", "text/csv")
