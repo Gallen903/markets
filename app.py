@@ -132,8 +132,18 @@ if st.button("Run"):
             st.subheader(f"{exchange} ({currency})")
             st.dataframe(gdf.drop(columns=["Exchange", "Currency"]), use_container_width=True)
 
-        # CSV download
-        csv = df.to_csv(index=False).encode("utf-8")
+        # --- Format CSV to match on-screen display ---
+        output_lines = []
+        for (exchange, currency), gdf in grouped:
+            output_lines.append(f"{exchange} ({currency})")
+            output_lines.append("Company,Price,5D % Change,YTD % Change")
+            for _, row in gdf.drop(columns=["Exchange", "Currency"]).iterrows():
+                output_lines.append(
+                    f"{row['Company']},{row['Price']},{row['5D % Change']},{row['YTD % Change']}"
+                )
+            output_lines.append("")  # blank line between groups
+
+        csv = "\n".join(output_lines).encode("utf-8")
         st.download_button("💾 Download CSV", csv, "stock_data.csv", "text/csv")
     else:
         st.warning("No stock data available for that date.")
