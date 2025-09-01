@@ -1,11 +1,12 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import date, timedelta
 import io
-import csv
 
-# --- Full Stock Master List ---
+# -----------------------
+# Master stock dictionary
+# -----------------------
 MASTER_STOCKS = {
     "Ireland": [
         ("AIB Group plc", "A5G.IR"),
@@ -29,7 +30,6 @@ MASTER_STOCKS = {
         ("Ryanair Holdings plc", "RYA.IR"),
         ("Uniphar plc", "UPR.IR"),
     ],
-
     "UK": [
         ("Associated British Foods", "ABF.L"),
         ("Burberry", "BRBY.L"),
@@ -42,22 +42,16 @@ MASTER_STOCKS = {
         ("Tesco plc", "TSCO.L"),
         ("Vodafone Group", "VOD.L"),
         ("hVIVO plc", "HVO.L"),
-        # Smurfit WestRock – London listing
         ("Smurfit WestRock Plc", "SWR.L"),
-        # Diageo – London ticker (DGE.L) instead of US ADR (DEO)
         ("Diageo", "DGE.L"),
-        # CRH – London ticker (CRH.L) instead of US (CRH)
         ("CRH plc", "CRH.L"),
-        # Flutter – NY ticker is FLUT, London is FLTR.L → keeping London here
         ("Flutter Entertainment plc", "FLTR.L"),
     ],
-
     "Europe": [
         ("Bankinter", "BKT.MC"),
         ("Danone S.A.", "BN.PA"),
         ("Heineken N.V.", "HEIA.AS"),
     ],
-
     "US": [
         ("AbbVie Inc.", "ABBV"),
         ("Abbott Laboratories", "ABT"),
@@ -71,7 +65,6 @@ MASTER_STOCKS = {
         ("Eli Lilly and Company", "LLY"),
         ("GE Aerospace", "GE"),
         ("HP Inc.", "HPQ"),
-        ("Icon Energy Corp.", "ICNR"),  # ⚠️ Please confirm if this is correct
         ("Intel Corporation", "INTC"),
         ("Johnson & Johnson", "JNJ"),
         ("Merck & Co., Inc.", "MRK"),
@@ -87,95 +80,92 @@ MASTER_STOCKS = {
     ]
 }
 
+REGION_ORDER = ["Ireland", "UK", "Europe", "US"]
 
-# --- Streamlit UI ---
-st.title("📊 Stock Dashboard")
-st.write("View stock prices with 5-day % change and year-to-date % change.")
+# -----------------------
+# Data fetcher
+# -----------------------
+def fetch_stock_data(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="ytd")
 
-date_str = st.date_input("Select date")
+        if hist.empty:
+            return None, None, None
 
-# Allow user to edit stock list
-stock_options = {f"{s['name']} ({s['ticker']})": s for s in MASTER_STOCKS}
-selected_labels = st.multiselect(
-    "Select stocks to include:", list(stock_options.keys()), default=list(stock_options.keys())
-)
-SELECTED_STOCKS = [stock_options[label] for label in selected_labels]
+        last_price = hist["Close"].iloc[-1]
 
-if st.button("Run"):
-    rows = []
-    for stock in SELECTED_STOCKS:
-        ticker = stock["ticker"]
-        try:
-            data = yf.download(
-                ticker, start=f"{date_str.year}-01-01", end=date_str + timedelta(days=1), progress=False
-            )
-            if data.empty:
-                continue
+        # Weekly change
+        if len(hist) > 5:
+            week_ago = hist["Close"].iloc[-6]
+        else:
+            week_ago = hist["Close"].iloc[0]
+        week_change = ((last_price - week_ago) / week_ago) * 100
 
-            valid_dates = data.index[data.index <= pd.to_datetime(date_str)]
-            if len(valid_dates) == 0:
-                continue
-            sel_date = valid_dates[-1]
+        # YTD change
+        start_price = hist["Close"].iloc[0]
+        ytd_change = ((last_price - start_price) / start_price) * 100
 
-            price = float(data.loc[sel_date, "Close"])
+        return round(last_price, 1), round(week_change, 1), round(ytd_change, 1)
+    except:
+        return None, None, None
 
-            # 5-day % change
-            past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
-            change_5d = None
-            if len(past_dates) > 0:
-                past_price = float(data.loc[past_dates[-1], "Close"])
-                change_5d = (price - past_price) / past_price * 100
+# -----------------------
+# App layout
+# -----------------------
+st.title("Stock Dashboard")
 
-            # YTD % change
-            ytd_price = float(data.iloc[0]["Close"])
-            change_ytd = (price - ytd_price) / ytd_price * 100
+if "selected_stocks" not in st.session_state:
+    st.session_state.selected_stocks = MASTER_STOCKS
 
-            rows.append({
-                "Company": stock["name"],
-                "Region": stock["region"],
-                "Currency": stock["currency"],
-                "Price": round(price, 1),
-                "5D % Change": round(change_5d, 1) if change_5d is not None else None,
-                "YTD % Change": round(change_ytd, 1),
-            })
-        except Exception:
-            continue
+if st.sidebar.button("Edit stock list"):
+    st.session_state.selected_stocks = {}
 
-    if rows:
-        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"])
-        grouped = df.groupby(["Region", "Currency"])
+    for region, stocks in MASTER_STOCKS.items():
+        selected = st.sidebar.multiselect(f"Select {region} stocks", [s[0] for s in stocks], [s[0] for s in stocks])
+        st.session_state.selected_stocks[region] = [(name, ticker) for name, ticker in stocks if name in selected]
 
-        # Display in Streamlit
-        for (region, currency), gdf in grouped:
-            st.subheader(f"{region} ({currency})")
-            st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
+# -----------------------
+# Build DataFrame
+# -----------------------
+rows = []
+for region in REGION_ORDER:
+    for name, ticker in st.session_state.selected_stocks.get(region, []):
+        price, week_change, ytd_change = fetch_stock_data(ticker)
+        if price is not None:
+            rows.append((region, name, price, week_change, ytd_change))
 
-        # --- CSV Output ---
-        REGION_LABELS = {
-            "Ireland": "Ireland (€)",
-            "UK": "UK (£)",
-            "Europe": "Europe (€)",
-            "US": "US ($)"
-        }
+df = pd.DataFrame(rows, columns=["Region", "Name", "Last price", "5D %change", "YTD % change"])
 
-        output = io.StringIO()
-        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+# -----------------------
+# Display by region
+# -----------------------
+for region in REGION_ORDER:
+    region_df = df[df["Region"] == region].drop(columns=["Region"])
+    if not region_df.empty:
+        st.subheader(region)
+        st.dataframe(region_df.set_index("Name"))
 
-        for region in ["Ireland", "UK", "Europe", "US"]:
-            for (r, currency), gdf in grouped:
-                if r != region:
-                    continue
-                # Write region header
-                writer.writerow([REGION_LABELS[r], "Last price", "5D %change", "YTD % change"])
-                # Write stock rows
-                for _, row in gdf.iterrows():
-                    company = row['Company'].replace('"', '')  # remove any quotes
-                    price = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
-                    c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
-                    cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
-                    writer.writerow([company, price, c5, cy])
+# -----------------------
+# CSV export
+# -----------------------
+def format_csv(df):
+    output = io.StringIO()
 
-        csv_bytes = '\ufeff' + output.getvalue()  # UTF-8 BOM for Excel
-        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
-    else:
-        st.warning("No stock data available for that date.")
+    for region in REGION_ORDER:
+        region_df = df[df["Region"] == region].drop(columns=["Region"])
+        if not region_df.empty:
+            if region == "Ireland":
+                header = "Ireland (EUR)\tLast price\t5D %change\tYTD % change\n"
+            elif region == "UK":
+                header = "UK (£)\tLast price\t5D %change\tYTD % change\n"
+            elif region == "Europe":
+                header = "Europe (€)\tLast price\t5D %change\tYTD % change\n"
+            elif region == "US":
+                header = "US ($)\tLast price\t5D %change\tYTD % change\n"
+            output.write(header)
+            region_df.to_csv(output, sep="\t", index=False, header=False)
+    return output.getvalue()
+
+csv_data = format_csv(df)
+st.download_button("Download CSV", csv_data, "stocks.csv", "text/csv")
