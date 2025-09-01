@@ -41,7 +41,7 @@ MASTER_STOCKS = [
     {"ticker": "BSN.F", "name": "Danone S.A.", "region": "Europe", "currency": "EUR"},
     {"ticker": "VOD.L", "name": "Vodafone Group", "region": "UK", "currency": "GBp"},
     {"ticker": "DCC.L", "name": "DCC plc", "region": "UK", "currency": "GBp"},
-    {"ticker": "GNCL.XC", "name": "Greencore Group plc", "region": "UK", "currency": "GBp"},
+    {"ticker": "GNCL.L", "name": "Greencore Group plc", "region": "UK", "currency": "GBp"},
     {"ticker": "GFTUL.XC", "name": "Grafton Group plc", "region": "UK", "currency": "GBp"},
     {"ticker": "HVO.L", "name": "hVIVO plc", "region": "UK", "currency": "GBp"},
     {"ticker": "POLB.L", "name": "Poolbeg Pharma PLC", "region": "UK", "currency": "GBp"},
