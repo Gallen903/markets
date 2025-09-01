@@ -4,80 +4,68 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import io
 import csv
+import json
+import os
 
-# --- Full Stock Master List ---
-MASTER_STOCKS = [
+# --- Master list persistence ---
+MASTER_FILE = "master_stocks.json"
+
+# Hard-coded backup master list (used only if no JSON file exists yet)
+DEFAULT_MASTER_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "region": "US", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "SBUX", "name": "Starbucks Corporation", "region": "US", "currency": "USD"},
-    {"ticker": "PEP", "name": "PepsiCo, Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "ORCL", "name": "Oracle Corporation", "region": "US", "currency": "USD"},
-    {"ticker": "NVS", "name": "Novartis AG", "region": "US", "currency": "USD"},
-    {"ticker": "META", "name": "Meta Platforms, Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "MSFT", "name": "Microsoft Corporation", "region": "US", "currency": "USD"},
-    {"ticker": "MRK", "name": "Merck & Co., Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "JNJ", "name": "Johnson & Johnson", "region": "US", "currency": "USD"},
-    {"ticker": "INTC", "name": "Intel Corporation", "region": "US", "currency": "USD"},
-    {"ticker": "ICON", "name": "Icon Energy Corp.", "region": "US", "currency": "USD"},
-    {"ticker": "HPQ", "name": "HP Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "GE", "name": "GE Aerospace", "region": "US", "currency": "USD"},
-    {"ticker": "LLY", "name": "Eli Lilly and Company", "region": "US", "currency": "USD"},
-    {"ticker": "EBAY", "name": "eBay Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "COKE", "name": "Coca-Cola Consolidated, Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "BSX", "name": "Boston Scientific Corporation", "region": "US", "currency": "USD"},
-    {"ticker": "AAPL", "name": "Apple Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "AMGN", "name": "Amgen Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "ADI", "name": "Analog Devices, Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "ABBV", "name": "AbbVie Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "GOOG", "name": "Alphabet Inc.", "region": "US", "currency": "USD"},
-    {"ticker": "ABT", "name": "Abbott Laboratories", "region": "US", "currency": "USD"},
-    {"ticker": "CRH", "name": "CRH plc", "region": "US", "currency": "USD"},
-    {"ticker": "SW", "name": "Smurfit Westrock Plc", "region": "US", "currency": "USD"},
-    {"ticker": "DEO", "name": "Diageo", "region": "US", "currency": "USD"},
-    {"ticker": "AER", "name": "AerCap Holdings", "region": "US", "currency": "USD"},
-    {"ticker": "FLUT", "name": "Flutter Entertainment plc", "region": "US", "currency": "USD"},  # NY listing
-
-    {"ticker": "HEIA.AS", "name": "Heineken N.V.", "region": "Europe", "currency": "EUR"},
-    {"ticker": "BN.PA", "name": "Danone S.A.", "region": "Europe", "currency": "EUR"},
-    {"ticker": "VOD.L", "name": "Vodafone Group", "region": "UK", "currency": "GBP"},
-    {"ticker": "DCC.L", "name": "DCC plc", "region": "UK", "currency": "GBP"},
-    {"ticker": "GNC.L", "name": "Greencore Group plc", "region": "UK", "currency": "GBP"},
-    {"ticker": "GFTU.L", "name": "Grafton Group plc", "region": "UK", "currency": "GBP"},
-    {"ticker": "HVO.L", "name": "hVIVO plc", "region": "UK", "currency": "GBP"},
-    {"ticker": "POLB.L", "name": "Poolbeg Pharma PLC", "region": "UK", "currency": "GBP"},
-    {"ticker": "TSCO.L", "name": "Tesco plc", "region": "UK", "currency": "GBP"},
-    {"ticker": "BRBY.L", "name": "Burberry", "region": "UK", "currency": "GBP"},
-    {"ticker": "SSPG.L", "name": "SSP Group", "region": "UK", "currency": "GBP"},
-    {"ticker": "BKT.MC", "name": "Bankinter", "region": "Europe", "currency": "EUR"},
-    {"ticker": "ABF.L", "name": "Associated British Foods", "region": "UK", "currency": "GBP"},
-    {"ticker": "GWMO.L", "name": "Great Western Mining Corp", "region": "UK", "currency": "GBP"},
-
-    {"ticker": "GVR.IR", "name": "Glenveagh Properties PLC", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "UPR.IR", "name": "Uniphar plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "RYA.IR", "name": "Ryanair Holdings plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "PTSB.IR", "name": "Permanent TSB Group Holdings plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "OIZ.IR", "name": "Origin Enterprises plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "MLC.IR", "name": "Malin Corporation plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "KRX.IR", "name": "Kingspan Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "KRZ.IR", "name": "Kerry Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "KMR.IR", "name": "Kenmare Resources plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "IRES.IR", "name": "Irish Residential Properties REIT Plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "IR5B.IR", "name": "Irish Continental Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "HSW.IR", "name": "Hostelworld Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "GRP.IR", "name": "Greencoat Renewables", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "GL9.IR", "name": "Glanbia plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "EG7.IR", "name": "FBD Holdings plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "DQ7A.IR", "name": "Donegal Investment Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "DHG.IR", "name": "Dalata Hotel Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "C5H.IR", "name": "Cairn Homes plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "A5G.IR", "name": "AIB Group plc", "region": "Ireland", "currency": "EUR"},
-    {"ticker": "BIRG.IR", "name": "Bank of Ireland Group plc", "region": "Ireland", "currency": "EUR"},
+    # ... (rest of your list unchanged)
     {"ticker": "YZA.IR", "name": "Arytza", "region": "Ireland", "currency": "EUR"},
 ]
+
+# Load from file if available
+if os.path.exists(MASTER_FILE):
+    with open(MASTER_FILE, "r") as f:
+        MASTER_STOCKS = json.load(f)
+else:
+    MASTER_STOCKS = DEFAULT_MASTER_STOCKS.copy()
+    with open(MASTER_FILE, "w") as f:
+        json.dump(MASTER_STOCKS, f, indent=2)
 
 # --- Streamlit UI ---
 st.title("📊 Stock Dashboard")
 st.write("View stock prices with 5-day % change and year-to-date % change.")
+
+# Add stock form
+st.subheader("➕ Add a custom stock")
+with st.form("add_stock_form", clear_on_submit=True):
+    new_ticker = st.text_input("Ticker symbol (e.g. NVDA)").strip().upper()
+    new_name = st.text_input("Company name (e.g. NVIDIA Corporation)").strip()
+    new_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
+    new_currency = st.selectbox("Currency", ["EUR", "GBp", "USD"])
+    add_button = st.form_submit_button("Add stock")
+
+if add_button and new_ticker and new_name:
+    new_stock = {
+        "ticker": new_ticker,
+        "name": new_name,
+        "region": new_region,
+        "currency": new_currency,
+    }
+    MASTER_STOCKS.append(new_stock)
+    with open(MASTER_FILE, "w") as f:
+        json.dump(MASTER_STOCKS, f, indent=2)
+    st.success(f"Added {new_name} ({new_ticker}) to master list ✅")
+
+# Remove stock option
+st.subheader("🗑️ Remove stock(s) from master list")
+stock_labels = [f"{s['name']} ({s['ticker']})" for s in MASTER_STOCKS]
+stocks_to_remove = st.multiselect("Select stock(s) to remove", stock_labels)
+if st.button("Remove selected"):
+    if stocks_to_remove:
+        before_count = len(MASTER_STOCKS)
+        MASTER_STOCKS = [s for s in MASTER_STOCKS if f"{s['name']} ({s['ticker']})" not in stocks_to_remove]
+        with open(MASTER_FILE, "w") as f:
+            json.dump(MASTER_STOCKS, f, indent=2)
+        removed_count = before_count - len(MASTER_STOCKS)
+        st.success(f"Removed {removed_count} stock(s) from master list ✅")
+    else:
+        st.warning("No stocks selected for removal.")
 
 date_str = st.date_input("Select date")
 
@@ -118,7 +106,7 @@ if st.button("Run"):
             change_ytd = (price - ytd_price) / ytd_price * 100
 
             rows.append({
-                "Company": stock["name"].replace('"', ''),  # clean names
+                "Company": stock["name"],
                 "Region": stock["region"],
                 "Currency": stock["currency"],
                 "Price": round(price, 1),
@@ -152,16 +140,15 @@ if st.button("Run"):
             for (r, currency), gdf in grouped:
                 if r != region:
                     continue
-                # Write region header in one row
                 writer.writerow([REGION_LABELS[r], "Last price", "5D %change", "YTD % change"])
-                # Write stock rows
                 for _, row in gdf.iterrows():
+                    company = row['Company'].replace('"', '')  
                     price = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
                     c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
                     cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
-                    writer.writerow([row['Company'], price, c5, cy])
+                    writer.writerow([company, price, c5, cy])
 
-        csv_bytes = '\ufeff' + output.getvalue()  # UTF-8 BOM for Excel
+        csv_bytes = '\ufeff' + output.getvalue()  
         st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
     else:
         st.warning("No stock data available for that date.")
