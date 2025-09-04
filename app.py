@@ -1,17 +1,16 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import timedelta
 import io
 import csv
-import json
+import sqlite3
 import os
 
-# --- File to persist added stocks ---
-STOCK_FILE = "user_stocks.json"
+DB_FILE = "stocks.db"
 
-# --- Full Original Stock Master List ---
-ORIGINAL_MASTER_STOCKS = [
+# --- Initial Master List (used only if DB is empty) ---
+MASTER_STOCKS = [
     {"ticker": "STT", "name": "State Street Corporation", "region": "US", "currency": "USD"},
     {"ticker": "PFE", "name": "Pfizer Inc.", "region": "US", "currency": "USD"},
     {"ticker": "SBUX", "name": "Starbucks Corporation", "region": "US", "currency": "USD"},
@@ -44,6 +43,8 @@ ORIGINAL_MASTER_STOCKS = [
 
     {"ticker": "HEIA.AS", "name": "Heineken N.V.", "region": "Europe", "currency": "EUR"},
     {"ticker": "BSN.F", "name": "Danone S.A.", "region": "Europe", "currency": "EUR"},
+    {"ticker": "BKT.MC", "name": "Bankinter", "region": "Europe", "currency": "EUR"},
+
     {"ticker": "VOD.L", "name": "Vodafone Group", "region": "UK", "currency": "GBp"},
     {"ticker": "DCC.L", "name": "DCC plc", "region": "UK", "currency": "GBp"},
     {"ticker": "GNCL.XC", "name": "Greencore Group plc", "region": "UK", "currency": "GBp"},
@@ -53,7 +54,6 @@ ORIGINAL_MASTER_STOCKS = [
     {"ticker": "TSCOL.XC", "name": "Tesco plc", "region": "UK", "currency": "GBp"},
     {"ticker": "BRBY.L", "name": "Burberry", "region": "UK", "currency": "GBp"},
     {"ticker": "SSPG.L", "name": "SSP Group", "region": "UK", "currency": "GBp"},
-    {"ticker": "BKT.MC", "name": "Bankinter", "region": "Europe", "currency": "EUR"},
     {"ticker": "ABF.L", "name": "Associated British Foods", "region": "UK", "currency": "GBp"},
     {"ticker": "GWMO.L", "name": "Great Western Mining Corp", "region": "UK", "currency": "GBp"},
 
@@ -80,59 +80,85 @@ ORIGINAL_MASTER_STOCKS = [
     {"ticker": "YZA.IR", "name": "Arytza", "region": "Ireland", "currency": "EUR"},
 ]
 
-# --- Load user-added stocks ---
-if os.path.exists(STOCK_FILE):
-    with open(STOCK_FILE, "r") as f:
-        USER_STOCKS = json.load(f)
-else:
-    USER_STOCKS = []
+# --- DB Setup ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            ticker TEXT PRIMARY KEY,
+            name TEXT,
+            region TEXT,
+            currency TEXT
+        )
+    """)
+    conn.commit()
 
-MASTER_STOCKS = ORIGINAL_MASTER_STOCKS + USER_STOCKS
+    # Populate with master list if empty
+    cur.execute("SELECT COUNT(*) FROM stocks")
+    if cur.fetchone()[0] == 0:
+        cur.executemany("INSERT INTO stocks (ticker, name, region, currency) VALUES (?, ?, ?, ?)", [
+            (s["ticker"], s["name"], s["region"], s["currency"]) for s in MASTER_STOCKS
+        ])
+        conn.commit()
+    conn.close()
+
+def load_stocks():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql("SELECT * FROM stocks", conn)
+    conn.close()
+    return df.to_dict("records")
+
+def save_stock(ticker, name, region, currency):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO stocks (ticker, name, region, currency) VALUES (?, ?, ?, ?)",
+                (ticker, name, region, currency))
+    conn.commit()
+    conn.close()
+
+def remove_stock(ticker):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
+    conn.commit()
+    conn.close()
 
 # --- Streamlit UI ---
 st.title("📊 Stock Dashboard")
 st.write("View stock prices with 5-day % change and year-to-date % change.")
 
+# Init DB and load stocks
+init_db()
+MASTER_STOCKS = load_stocks()
+
 date_str = st.date_input("Select date")
 
-# --- Stock Selection ---
+# Manage stocks
+st.subheader("Manage Stock List")
+new_ticker = st.text_input("Ticker")
+new_name = st.text_input("Company Name")
+new_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
+new_currency = st.selectbox("Currency", ["EUR", "GBp", "USD"])
+
+if st.button("Add Stock"):
+    if new_ticker and new_name:
+        save_stock(new_ticker, new_name, new_region, new_currency)
+        st.success(f"Added {new_name} ({new_ticker})")
+
+remove_ticker = st.selectbox("Remove Stock", [""] + [s["ticker"] for s in MASTER_STOCKS])
+if st.button("Remove Stock") and remove_ticker:
+    remove_stock(remove_ticker)
+    st.success(f"Removed {remove_ticker}")
+
+# Select stocks to include
 stock_options = {f"{s['name']} ({s['ticker']})": s for s in MASTER_STOCKS}
 selected_labels = st.multiselect(
     "Select stocks to include:", list(stock_options.keys()), default=list(stock_options.keys())
 )
 SELECTED_STOCKS = [stock_options[label] for label in selected_labels]
 
-# --- Add new stock ---
-st.subheader("➕ Add a new stock")
-new_ticker = st.text_input("Ticker")
-new_name = st.text_input("Company Name")
-new_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
-new_currency = st.text_input("Currency (e.g., USD, EUR, GBp)")
-
-if st.button("Add Stock"):
-    if new_ticker and new_name and new_region and new_currency:
-        new_stock = {"ticker": new_ticker.upper(), "name": new_name, "region": new_region, "currency": new_currency}
-        MASTER_STOCKS.append(new_stock)
-        USER_STOCKS.append(new_stock)
-        # Save to JSON
-        with open(STOCK_FILE, "w") as f:
-            json.dump(USER_STOCKS, f)
-        st.success(f"Added {new_name} ({new_ticker.upper()})")
-    else:
-        st.warning("Please fill all fields.")
-
-# --- Remove stock ---
-st.subheader("➖ Remove a stock")
-remove_label = st.selectbox("Select stock to remove", list(stock_options.keys()))
-if st.button("Remove Stock"):
-    remove_stock = stock_options[remove_label]
-    MASTER_STOCKS = [s for s in MASTER_STOCKS if s["ticker"] != remove_stock["ticker"]]
-    USER_STOCKS = [s for s in USER_STOCKS if s["ticker"] != remove_stock["ticker"]]
-    with open(STOCK_FILE, "w") as f:
-        json.dump(USER_STOCKS, f)
-    st.success(f"Removed {remove_stock['name']}")
-
-# --- Run analysis ---
+# --- Run Analysis ---
 if st.button("Run"):
     rows = []
     for stock in SELECTED_STOCKS:
@@ -151,12 +177,14 @@ if st.button("Run"):
 
             price = float(data.loc[sel_date, "Close"])
 
+            # 5-day % change
             past_dates = data.index[data.index <= sel_date - timedelta(days=5)]
             change_5d = None
             if len(past_dates) > 0:
                 past_price = float(data.loc[past_dates[-1], "Close"])
                 change_5d = (price - past_price) / past_price * 100
 
+            # YTD % change
             ytd_price = float(data.iloc[0]["Close"])
             change_ytd = (price - ytd_price) / ytd_price * 100
 
@@ -175,12 +203,10 @@ if st.button("Run"):
         df = pd.DataFrame(rows).sort_values(by=["Region", "Company"])
         grouped = df.groupby(["Region", "Currency"])
 
-        # Display
         for (region, currency), gdf in grouped:
             st.subheader(f"{region} ({currency})")
             st.dataframe(gdf.drop(columns=["Region", "Currency"]), use_container_width=True)
 
-        # CSV Output
         REGION_LABELS = {
             "Ireland": "Ireland (€)",
             "UK": "UK (£)",
@@ -189,7 +215,7 @@ if st.button("Run"):
         }
 
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
 
         for region in ["Ireland", "UK", "Europe", "US"]:
             for (r, currency), gdf in grouped:
@@ -197,7 +223,7 @@ if st.button("Run"):
                     continue
                 writer.writerow([REGION_LABELS[r], "Last price", "5D %change", "YTD % change"])
                 for _, row in gdf.iterrows():
-                    company = row['Company']
+                    company = row['Company'].replace('"', '')
                     price = f"{row['Price']:.1f}" if pd.notnull(row['Price']) else ""
                     c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row['5D % Change']) else ""
                     cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row['YTD % Change']) else ""
