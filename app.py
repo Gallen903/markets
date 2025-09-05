@@ -9,12 +9,16 @@ import csv
 DB_PATH = "stocks.db"
 
 # -----------------------------
-# SQLite helpers
+# SQLite helpers (with migration)
 # -----------------------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db_with_defaults():
+    """
+    Create table if missing and INSERT OR IGNORE each default row.
+    This ensures existing DB is preserved and new default tickers are added.
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -25,95 +29,104 @@ def init_db_with_defaults():
             currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
-    # Only seed if empty
-    cur.execute("SELECT COUNT(*) FROM stocks")
-    if cur.fetchone()[0] == 0:
-        defaults = [
-            # --- US ---
-            ("STT","State Street Corporation","US","USD"),
-            ("PFE","Pfizer Inc.","US","USD"),
-            ("SBUX","Starbucks Corporation","US","USD"),
-            ("PEP","PepsiCo, Inc.","US","USD"),
-            ("ORCL","Oracle Corporation","US","USD"),
-            ("NVS","Novartis AG","US","USD"),
-            ("META","Meta Platforms, Inc.","US","USD"),
-            ("MSFT","Microsoft Corporation","US","USD"),
-            ("MRK","Merck & Co., Inc.","US","USD"),
-            ("JNJ","Johnson & Johnson","US","USD"),
-            ("INTC","Intel Corporation","US","USD"),
-            ("ICON","Icon Energy Corp.","US","USD"),
-            ("HPQ","HP Inc.","US","USD"),
-            ("GE","GE Aerospace","US","USD"),
-            ("LLY","Eli Lilly and Company","US","USD"),
-            ("EBAY","eBay Inc.","US","USD"),
-            ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
-            ("BSX","Boston Scientific Corporation","US","USD"),
-            ("AAPL","Apple Inc.","US","USD"),
-            ("AMGN","Amgen Inc.","US","USD"),
-            ("ADI","Analog Devices, Inc.","US","USD"),
-            ("ABBV","AbbVie Inc.","US","USD"),
-            ("GOOG","Alphabet Inc.","US","USD"),
-            ("ABT","Abbott Laboratories","US","USD"),
-            ("CRH","CRH plc","US","USD"),
-            ("SW","Smurfit Westrock Plc","US","USD"),
-            ("DEO","Diageo","US","USD"),
-            ("AER","AerCap Holdings","US","USD"),
-            ("FLUT","Flutter Entertainment plc","US","USD"),
-            # New US additions
-            ("AMZN","Amazon.com, Inc.","US","USD"),
-            ("NVDA","NVIDIA Corporation","US","USD"),
-            ("ARMK","Aramark","US","USD"),
-            ("TSLA","Tesla, Inc.","US","USD"),
-            ("BMY","Bristol Myers Squibb","US","USD"),
-            ("CBRE","CBRE Group, Inc.","US","USD"),
 
-            # --- Europe ---
-            ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-            ("BN.PA","Danone S.A.","Europe","EUR"),
-            ("BKT.MC","Bankinter","Europe","EUR"),
-            ("ORSTED.CO","Orsted A/S","Europe","EUR"),
-            ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
-            ("SAN.PA","Sanofi","Europe","EUR"),
-            ("ROG.SW","Roche Holding AG","Europe","EUR"),
+    # Full defaults list (includes your extra stocks)
+    defaults = [
+        # --- US ---
+        ("STT","State Street Corporation","US","USD"),
+        ("PFE","Pfizer Inc.","US","USD"),
+        ("SBUX","Starbucks Corporation","US","USD"),
+        ("PEP","PepsiCo, Inc.","US","USD"),
+        ("ORCL","Oracle Corporation","US","USD"),
+        ("NVS","Novartis AG","US","USD"),
+        ("META","Meta Platforms, Inc.","US","USD"),
+        ("MSFT","Microsoft Corporation","US","USD"),
+        ("MRK","Merck & Co., Inc.","US","USD"),
+        ("JNJ","Johnson & Johnson","US","USD"),
+        ("INTC","Intel Corporation","US","USD"),
+        ("ICON","Icon Energy Corp.","US","USD"),
+        ("HPQ","HP Inc.","US","USD"),
+        ("GE","GE Aerospace","US","USD"),
+        ("LLY","Eli Lilly and Company","US","USD"),
+        ("EBAY","eBay Inc.","US","USD"),
+        ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
+        ("BSX","Boston Scientific Corporation","US","USD"),
+        ("AAPL","Apple Inc.","US","USD"),
+        ("AMGN","Amgen Inc.","US","USD"),
+        ("ADI","Analog Devices, Inc.","US","USD"),
+        ("ABBV","AbbVie Inc.","US","USD"),
+        ("GOOG","Alphabet Inc.","US","USD"),
+        ("ABT","Abbott Laboratories","US","USD"),
+        ("CRH","CRH plc","US","USD"),
+        ("SW","Smurfit Westrock Plc","US","USD"),
+        ("DEO","Diageo","US","USD"),
+        ("AER","AerCap Holdings","US","USD"),
+        ("FLUT","Flutter Entertainment plc","US","USD"),
+        # Additional US stocks you requested
+        ("AMZN","Amazon.com, Inc.","US","USD"),
+        ("NVDA","NVIDIA Corporation","US","USD"),
+        ("ARMK","Aramark","US","USD"),
+        ("TSLA","Tesla, Inc.","US","USD"),
+        ("BMY","Bristol Myers Squibb","US","USD"),
+        ("CBRE","CBRE Group, Inc.","US","USD"),
 
-            # --- UK ---
-            ("VOD.L","Vodafone Group","UK","GBp"),
-            ("DCC.L","DCC plc","UK","GBp"),
-            ("GNC.L","Greencore Group plc","UK","GBp"),
-            ("GFTU.L","Grafton Group plc","UK","GBp"),
-            ("HVO.L","hVIVO plc","UK","GBp"),
-            ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-            ("TSCO.L","Tesco plc","UK","GBp"),
-            ("BRBY.L","Burberry","UK","GBp"),
-            ("SSPG.L","SSP Group","UK","GBp"),
-            ("ABF.L","Associated British Foods","UK","GBp"),
-            ("GWMO.L","Great Western Mining Corp","UK","GBp"),
-            ("SVS.L","Savills plc","UK","GBp"),
+        # --- Europe (non-UK, non-Ireland) ---
+        ("HEIA.AS","Heineken N.V.","Europe","EUR"),
+        ("BSN.F","Danone S.A.","Europe","EUR"),
+        # Note: some tickers have multiple venue representations; this is what we use
+        ("BKT.MC","Bankinter","Europe","EUR"),
+        ("ORSTED.CO","Orsted A/S","Europe","EUR"),
+        ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
+        ("SAN.PA","Sanofi","Europe","EUR"),
+        ("ROG.SW","Roche Holding AG","Europe","EUR"),
 
-            # --- Ireland ---
-            ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
-            ("UPR.IR","Uniphar plc","Ireland","EUR"),
-            ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
-            ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
-            ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
-            ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
-            ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
-            ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
-            ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
-            ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
-            ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
-            ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
-            ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
-            ("GL9.IR","Glanbia plc","Ireland","EUR"),
-            ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
-            ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
-            ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
-            ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
-            ("A5G.IR","AIB Group plc","Ireland","EUR"),
-            ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
-            ("DOLE","Dole plc","Ireland","USD"),
-        ]
-        cur.executemany("INSERT INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)", defaults)
+        # --- UK ---
+        ("VOD.L","Vodafone Group","UK","GBp"),
+        ("DCC.L","DCC plc","UK","GBp"),
+        ("GNCL.XC","Greencore Group plc","UK","GBp"),
+        ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+        ("HVO.L","hVIVO plc","UK","GBp"),
+        ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
+        ("TSCOL.XC","Tesco plc","UK","GBp"),
+        ("BRBY.L","Burberry","UK","GBp"),
+        ("SSPG.L","SSP Group","UK","GBp"),
+        ("ABF.L","Associated British Foods","UK","GBp"),
+        ("GWMO.L","Great Western Mining Corp","UK","GBp"),
+        ("SVS.L","Savills plc","UK","GBp"),
+
+        # --- Ireland ---
+        ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
+        ("UPR.IR","Uniphar plc","Ireland","EUR"),
+        ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
+        ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
+        ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
+        ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
+        ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
+        ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
+        ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
+        ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
+        ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
+        ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
+        ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
+        ("GL9.IR","Glanbia plc","Ireland","EUR"),
+        ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
+        ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
+        ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
+        ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
+        ("A5G.IR","AIB Group plc","Ireland","EUR"),
+        ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
+        ("YZA.IR","Arytza","Ireland","EUR"),
+        # Dole listed in your earlier lists (we keep it in Ireland group with USD as you requested previously)
+        ("DOLE","Dole plc","Ireland","USD"),
+    ]
+
+    # Insert each default only if missing
+    for t, n, r, c in defaults:
+        cur.execute(
+            "INSERT OR IGNORE INTO stocks (ticker, name, region, currency) VALUES (?, ?, ?, ?)",
+            (t, n, r, c)
+        )
+
     conn.commit()
     conn.close()
 
@@ -183,6 +196,7 @@ st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
 st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
 
+# Initialize DB (will insert missing defaults if DB exists)
 init_db_with_defaults()
 stocks_df = db_all_stocks()
 
