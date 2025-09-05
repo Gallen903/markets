@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta, date
+from datetime import timedelta, date
 import sqlite3
 import io
 import csv
@@ -22,8 +22,8 @@ def init_db_with_defaults():
         CREATE TABLE IF NOT EXISTS stocks (
             ticker TEXT PRIMARY KEY,
             name   TEXT NOT NULL,
-            region TEXT NOT NULL,
-            currency TEXT NOT NULL
+            region TEXT NOT NULL,   -- Ireland | UK | Europe | US
+            currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
     cur.execute("SELECT COUNT(*) FROM stocks")
@@ -62,27 +62,27 @@ def init_db_with_defaults():
             ("AMZN","Amazon.com Inc.","US","USD"),
             ("NVDA","NVIDIA Corporation","US","USD"),
             ("ARMK","Aramark","US","USD"),
-            ("TSLA","Tesla Inc.","US","USD"),
-            ("BMY","Bristol Myers Squibb","US","USD"),
+            ("TSLA","Tesla, Inc.","US","USD"),
+            ("BMY","Bristol-Myers Squibb","US","USD"),
             ("CBRE","CBRE Group, Inc.","US","USD"),
 
             # --- Europe ---
             ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-            ("BSN.F","Danone S.A.","Europe","EUR"),
+            ("BN.PA","Danone S.A.","Europe","EUR"),
             ("BKT.MC","Bankinter","Europe","EUR"),
             ("ORSTED.CO","Ørsted A/S","Europe","EUR"),
-            ("IBE.MC","Iberdrola, S.A.","Europe","EUR"),
+            ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
             ("SAN.PA","Sanofi","Europe","EUR"),
             ("ROG.SW","Roche Holding AG","Europe","EUR"),
 
             # --- UK ---
             ("VOD.L","Vodafone Group","UK","GBp"),
             ("DCC.L","DCC plc","UK","GBp"),
-            ("GNCL.XC","Greencore Group plc","UK","GBp"),
-            ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+            ("GNC.L","Greencore Group plc","UK","GBp"),
+            ("GFTU.L","Grafton Group plc","UK","GBp"),
             ("HVO.L","hVIVO plc","UK","GBp"),
             ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-            ("TSCOL.XC","Tesco plc","UK","GBp"),
+            ("TSCO.L","Tesco plc","UK","GBp"),
             ("BRBY.L","Burberry","UK","GBp"),
             ("SSPG.L","SSP Group","UK","GBp"),
             ("ABF.L","Associated British Foods","UK","GBp"),
@@ -141,7 +141,7 @@ def db_remove_stocks(tickers):
     conn.close()
 
 # -----------------------------
-# Finance helpers (Adj Close)
+# Finance helpers
 # -----------------------------
 def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp):
     if tkr_hist.empty:
@@ -150,7 +150,7 @@ def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timest
     if len(idx) == 0:
         return None, None
     dt = idx[-1]
-    return float(tkr_hist.loc[dt, "Adj Close"]), dt
+    return float(tkr_hist.loc[dt, "Close"]), dt
 
 def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: int):
     if tkr_hist.empty:
@@ -159,19 +159,18 @@ def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: in
     if len(idx) <= n:
         return None
     past_dt = idx[-(n+1)]
-    return float(tkr_hist.loc[past_dt, "Adj Close"])
+    return float(tkr_hist.loc[past_dt, "Close"])
 
-def prior_year_last_close(ticker: str, target_year: int):
-    start = f"{target_year-1}-12-01"
-    end   = f"{target_year}-01-05"
-    hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+def first_close_of_year(ticker: str, target_year: int):
+    start = f"{target_year}-01-01"
+    end   = f"{target_year}-01-15"
+    hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
     if hist.empty:
         return None
-    cutoff = pd.Timestamp(f"{target_year}-01-01")
-    idx = hist.index[hist.index < cutoff]
+    idx = hist.index[hist.index >= pd.Timestamp(start)]
     if len(idx) == 0:
-        return float(hist.iloc[0]["Adj Close"])
-    return float(hist.loc[idx[-1], "Adj Close"])
+        return None
+    return float(hist.loc[idx[0], "Close"])
 
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
@@ -181,7 +180,7 @@ def currency_symbol(cur: str) -> str:
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, YTD % change (all use adjusted closes for Yahoo parity).")
+st.caption("Last price, 5-day % change, YTD % change (YTD now matches Yahoo Finance baseline).")
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -193,7 +192,7 @@ with colB:
     st.write(" ")
     run = st.button("Run")
 
-# Add/remove stocks
+# Editor
 with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
@@ -207,7 +206,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                 db_add_stock(a_ticker, a_name, a_region, a_curr)
                 st.success(f"Saved {a_name} ({a_ticker})")
             else:
-                st.warning("Please provide Ticker and Company name.")
+                st.warning("Please provide at least Ticker and Company name.")
     with c2:
         st.markdown("**Remove stocks**")
         rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
@@ -242,7 +241,7 @@ if run:
                 start=f"{selected_date.year}-01-01",
                 end=selected_date + timedelta(days=1),
                 progress=False,
-                auto_adjust=False,
+                auto_adjust=True,
             )
             if hist.empty:
                 continue
@@ -254,7 +253,7 @@ if run:
             c_5ago = close_n_trading_days_ago(hist, p_dt, 5)
             chg_5d = (price - c_5ago) / c_5ago * 100.0 if c_5ago else None
 
-            base = prior_year_last_close(tkr, selected_date.year)
+            base = first_close_of_year(tkr, selected_date.year)
             chg_ytd = (price - base) / base * 100.0 if base else None
 
             rows.append({
