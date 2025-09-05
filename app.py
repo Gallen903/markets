@@ -59,16 +59,16 @@ def init_db_with_defaults():
             ("DEO","Diageo","US","USD"),
             ("AER","AerCap Holdings","US","USD"),
             ("FLUT","Flutter Entertainment plc","US","USD"),
-            ("AMZN","Amazon.com, Inc.","US","USD"),
+            ("AMZN","Amazon.com Inc.","US","USD"),
             ("NVDA","NVIDIA Corporation","US","USD"),
             ("ARMK","Aramark","US","USD"),
-            ("TSLA","Tesla, Inc.","US","USD"),
-            ("BMY","Bristol-Myers Squibb Company","US","USD"),
+            ("TSLA","Tesla Inc.","US","USD"),
+            ("BMY","Bristol Myers Squibb","US","USD"),
             ("CBRE","CBRE Group, Inc.","US","USD"),
 
             # --- Europe ---
             ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-            ("BN.PA","Danone S.A.","Europe","EUR"),
+            ("BSN.F","Danone S.A.","Europe","EUR"),
             ("BKT.MC","Bankinter","Europe","EUR"),
             ("ORSTED.CO","Ørsted A/S","Europe","EUR"),
             ("IBE.MC","Iberdrola, S.A.","Europe","EUR"),
@@ -141,7 +141,7 @@ def db_remove_stocks(tickers):
     conn.close()
 
 # -----------------------------
-# Finance helpers
+# Finance helpers (Adj Close)
 # -----------------------------
 def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp):
     if tkr_hist.empty:
@@ -150,7 +150,7 @@ def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timest
     if len(idx) == 0:
         return None, None
     dt = idx[-1]
-    return float(tkr_hist.loc[dt, "Close"]), dt
+    return float(tkr_hist.loc[dt, "Adj Close"]), dt
 
 def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: int):
     if tkr_hist.empty:
@@ -159,10 +159,9 @@ def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: in
     if len(idx) <= n:
         return None
     past_dt = idx[-(n+1)]
-    return float(tkr_hist.loc[past_dt, "Close"])
+    return float(tkr_hist.loc[past_dt, "Adj Close"])
 
 def prior_year_last_close(ticker: str, target_year: int):
-    """Get adjusted close on the last trading day of the prior year"""
     start = f"{target_year-1}-12-01"
     end   = f"{target_year}-01-05"
     hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
@@ -182,7 +181,7 @@ def currency_symbol(cur: str) -> str:
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year adjusted close).")
+st.caption("Last price, 5-day % change, YTD % change (all use adjusted closes for Yahoo parity).")
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -194,7 +193,7 @@ with colB:
     st.write(" ")
     run = st.button("Run")
 
-# Editor
+# Add/remove stocks
 with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
@@ -208,7 +207,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                 db_add_stock(a_ticker, a_name, a_region, a_curr)
                 st.success(f"Saved {a_name} ({a_ticker})")
             else:
-                st.warning("Please provide at least Ticker and Company name.")
+                st.warning("Please provide Ticker and Company name.")
     with c2:
         st.markdown("**Remove stocks**")
         rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
@@ -253,13 +252,9 @@ if run:
                 continue
 
             c_5ago = close_n_trading_days_ago(hist, p_dt, 5)
-            chg_5d = None
-            if c_5ago is not None and c_5ago != 0:
-                chg_5d = (price - c_5ago) / c_5ago * 100.0
+            chg_5d = (price - c_5ago) / c_5ago * 100.0 if c_5ago else None
 
             base = prior_year_last_close(tkr, selected_date.year)
-            if base is None:
-                base = float(hist.iloc[0]["Adj Close"])
             chg_ytd = (price - base) / base * 100.0 if base else None
 
             rows.append({
