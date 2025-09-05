@@ -1,11 +1,10 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta, date
+from datetime import timedelta, date
 import sqlite3
 import io
 import csv
-from pathlib import Path
 
 DB_PATH = "stocks.db"
 
@@ -60,24 +59,36 @@ def init_db_with_defaults():
             ("DEO","Diageo","US","USD"),
             ("AER","AerCap Holdings","US","USD"),
             ("FLUT","Flutter Entertainment plc","US","USD"),
+            # New US additions
+            ("AMZN","Amazon.com, Inc.","US","USD"),
+            ("NVDA","NVIDIA Corporation","US","USD"),
+            ("ARMK","Aramark","US","USD"),
+            ("TSLA","Tesla, Inc.","US","USD"),
+            ("BMY","Bristol Myers Squibb","US","USD"),
+            ("CBRE","CBRE Group, Inc.","US","USD"),
 
-            # --- Europe (non-UK, non-Ireland) ---
+            # --- Europe ---
             ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-            ("BSN.F","Danone S.A.","Europe","EUR"),
+            ("BN.PA","Danone S.A.","Europe","EUR"),
             ("BKT.MC","Bankinter","Europe","EUR"),
+            ("ORSTED.CO","Orsted A/S","Europe","EUR"),
+            ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
+            ("SAN.PA","Sanofi","Europe","EUR"),
+            ("ROG.SW","Roche Holding AG","Europe","EUR"),
 
             # --- UK ---
             ("VOD.L","Vodafone Group","UK","GBp"),
             ("DCC.L","DCC plc","UK","GBp"),
-            ("GNCL.XC","Greencore Group plc","UK","GBp"),
-            ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+            ("GNC.L","Greencore Group plc","UK","GBp"),
+            ("GFTU.L","Grafton Group plc","UK","GBp"),
             ("HVO.L","hVIVO plc","UK","GBp"),
             ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-            ("TSCOL.XC","Tesco plc","UK","GBp"),
+            ("TSCO.L","Tesco plc","UK","GBp"),
             ("BRBY.L","Burberry","UK","GBp"),
             ("SSPG.L","SSP Group","UK","GBp"),
             ("ABF.L","Associated British Foods","UK","GBp"),
             ("GWMO.L","Great Western Mining Corp","UK","GBp"),
+            ("SVS.L","Savills plc","UK","GBp"),
 
             # --- Ireland ---
             ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
@@ -100,7 +111,7 @@ def init_db_with_defaults():
             ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
             ("A5G.IR","AIB Group plc","Ireland","EUR"),
             ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
-            ("YZA.IR","Arytza","Ireland","EUR"),
+            ("DOLE","Dole plc","Ireland","USD"),
         ]
         cur.executemany("INSERT INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)", defaults)
     conn.commit()
