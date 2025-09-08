@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, date
 import sqlite3
 import io
 import csv
+from pathlib import Path
 
 DB_PATH = "stocks.db"
 
@@ -21,10 +22,87 @@ def init_db_with_defaults():
         CREATE TABLE IF NOT EXISTS stocks (
             ticker TEXT PRIMARY KEY,
             name   TEXT NOT NULL,
-            region TEXT NOT NULL,
-            currency TEXT NOT NULL
+            region TEXT NOT NULL,   -- Ireland | UK | Europe | US
+            currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
+    # Only seed if empty
+    cur.execute("SELECT COUNT(*) FROM stocks")
+    if cur.fetchone()[0] == 0:
+        defaults = [
+            # --- US ---
+            ("STT","State Street Corporation","US","USD"),
+            ("PFE","Pfizer Inc.","US","USD"),
+            ("SBUX","Starbucks Corporation","US","USD"),
+            ("PEP","PepsiCo, Inc.","US","USD"),
+            ("ORCL","Oracle Corporation","US","USD"),
+            ("NVS","Novartis AG","US","USD"),
+            ("META","Meta Platforms, Inc.","US","USD"),
+            ("MSFT","Microsoft Corporation","US","USD"),
+            ("MRK","Merck & Co., Inc.","US","USD"),
+            ("JNJ","Johnson & Johnson","US","USD"),
+            ("INTC","Intel Corporation","US","USD"),
+            ("ICON","Icon Energy Corp.","US","USD"),
+            ("HPQ","HP Inc.","US","USD"),
+            ("GE","GE Aerospace","US","USD"),
+            ("LLY","Eli Lilly and Company","US","USD"),
+            ("EBAY","eBay Inc.","US","USD"),
+            ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
+            ("BSX","Boston Scientific Corporation","US","USD"),
+            ("AAPL","Apple Inc.","US","USD"),
+            ("AMGN","Amgen Inc.","US","USD"),
+            ("ADI","Analog Devices, Inc.","US","USD"),
+            ("ABBV","AbbVie Inc.","US","USD"),
+            ("GOOG","Alphabet Inc.","US","USD"),
+            ("ABT","Abbott Laboratories","US","USD"),
+            ("CRH","CRH plc","US","USD"),
+            ("SW","Smurfit Westrock Plc","US","USD"),
+            ("DEO","Diageo","US","USD"),
+            ("AER","AerCap Holdings","US","USD"),
+            ("FLUT","Flutter Entertainment plc","US","USD"),
+
+            # --- Europe (non-UK, non-Ireland) ---
+            ("HEIA.AS","Heineken N.V.","Europe","EUR"),
+            ("BSN.F","Danone S.A.","Europe","EUR"),
+            ("BKT.MC","Bankinter","Europe","EUR"),
+
+            # --- UK ---
+            ("VOD.L","Vodafone Group","UK","GBp"),
+            ("DCC.L","DCC plc","UK","GBp"),
+            ("GNCL.XC","Greencore Group plc","UK","GBp"),
+            ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+            ("HVO.L","hVIVO plc","UK","GBp"),
+            ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
+            ("TSCOL.XC","Tesco plc","UK","GBp"),
+            ("BRBY.L","Burberry","UK","GBp"),
+            ("SSPG.L","SSP Group","UK","GBp"),
+            ("ABF.L","Associated British Foods","UK","GBp"),
+            ("GWMO.L","Great Western Mining Corp","UK","GBp"),
+
+            # --- Ireland ---
+            ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
+            ("UPR.IR","Uniphar plc","Ireland","EUR"),
+            ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
+            ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
+            ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
+            ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
+            ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
+            ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
+            ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
+            ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
+            ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
+            ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
+            ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
+            ("GL9.IR","Glanbia plc","Ireland","EUR"),
+            ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
+            ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
+            ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
+            ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
+            ("A5G.IR","AIB Group plc","Ireland","EUR"),
+            ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
+            ("YZA.IR","Arytza","Ireland","EUR"),
+        ]
+        cur.executemany("INSERT INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)", defaults)
     conn.commit()
     conn.close()
 
@@ -61,7 +139,7 @@ def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timest
     if len(idx) == 0:
         return None, None
     dt = idx[-1]
-    return float(tkr_hist.loc[dt, "Close"]), dt
+    return float(tkr_hist.loc[dt, "Adj Close"]), dt  # use adjusted close
 
 def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: int):
     if tkr_hist.empty:
@@ -70,19 +148,19 @@ def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: in
     if len(idx) <= n:
         return None
     past_dt = idx[-(n+1)]
-    return float(tkr_hist.loc[past_dt, "Close"])
+    return float(tkr_hist.loc[past_dt, "Adj Close"])  # adjusted close
 
 def prior_year_last_close(ticker: str, target_year: int):
     start = f"{target_year-1}-12-01"
-    end   = f"{target_year}-01-02"
+    end   = f"{target_year}-01-10"
     hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
     if hist.empty:
         return None
     cutoff = pd.Timestamp(f"{target_year}-01-01")
     idx = hist.index[hist.index < cutoff]
     if len(idx) == 0:
-        return float(hist.iloc[0]["Close"])
-    return float(hist.loc[idx[-1], "Close"])
+        return float(hist.iloc[0]["Adj Close"])
+    return float(hist.loc[idx[-1], "Adj Close"])
 
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
@@ -92,7 +170,7 @@ def currency_symbol(cur: str) -> str:
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, YTD % change (Yahoo YTD if available).")
+st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -151,7 +229,7 @@ if run:
             hist = yf.download(
                 tkr,
                 start=f"{selected_date.year}-01-01",
-                end=selected_date + timedelta(days=1),
+                end=selected_date + timedelta(days=3),  # extend by 3 days
                 progress=False,
                 auto_adjust=False,
             )
@@ -167,21 +245,10 @@ if run:
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
 
-            # --- Yahoo YTD Return ---
-            ytd_return = None
-            try:
-                info = yf.Ticker(tkr).info
-                if "ytdReturn" in info and info["ytdReturn"] is not None:
-                    ytd_return = info["ytdReturn"] * 100.0
-            except Exception:
-                pass
-
-            # fallback if Yahoo YTD missing
-            if ytd_return is None:
-                base = prior_year_last_close(tkr, selected_date.year)
-                if base is None:
-                    base = float(hist.iloc[0]["Close"])
-                ytd_return = (price - base) / base * 100.0 if base else None
+            base = prior_year_last_close(tkr, selected_date.year)
+            if base is None:
+                base = float(hist.iloc[0]["Adj Close"])
+            chg_ytd = (price - base) / base * 100.0 if base else None
 
             rows.append({
                 "Company": s["name"],
@@ -189,7 +256,7 @@ if run:
                 "Currency": s["currency"],
                 "Price": round(price, 1),
                 "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
-                "YTD % Change": round(ytd_return, 1) if ytd_return is not None else None,
+                "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
             })
         except Exception:
             continue
