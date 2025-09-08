@@ -417,7 +417,6 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                 st.warning("Please provide at least Ticker and Company name.")
     with c2:
         st.markdown("**Remove stocks**")
-        rem_choices = [f"{r['name']} ({r['ticker']})"] + []
         rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
         rem_sel = st.multiselect("Select to remove", rem_choices, [])
         if st.button("Remove selected"):
