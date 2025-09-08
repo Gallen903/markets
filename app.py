@@ -184,7 +184,8 @@ def _col(use_price_return: bool) -> str:
 EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
 def _is_eu_like(ticker: str, region: str) -> bool:
     t = ticker.upper()
-    return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for s in EU_SUFFIXES)
+    # FIXED: correct variable name in the generator
+    return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for suf in EU_SUFFIXES)
 
 # -----------------------------
 # Yahoo chart JSON helpers
@@ -338,7 +339,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             conn_rm.commit(); conn_rm.close()
             st.success(f"Removed {len(tickers)} stock(s)")
 
-# ---- Manual YTD baselines UI (restored)
+# ---- Manual YTD baselines UI
 with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
     cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
     st.caption("Define the **baseline price** used for YTD % for that ticker in this year (EUR/GBp/USD).")
@@ -462,13 +463,15 @@ if run:
                 if ref_val is not None and ref_val != 0:
                     chg_5d = (price_num - ref_val) / ref_val * 100.0
 
-            # YTD change
+            # YTD change (+ badge if manual baseline used)
+            manual_used = False
             chg_ytd = None
             manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
             if manual_ref is not None:
                 base = manual_ref["price"]
                 if base:
                     chg_ytd = (price_num - float(base)) / float(base) * 100.0
+                    manual_used = True
             else:
                 # Auto baseline from same series
                 if prefer_chart:
@@ -503,6 +506,7 @@ if run:
 
             rows.append({
                 "Company": s["name"],
+                "Manual": "🧭" if manual_used else "",
                 "Region": s["region"],
                 "Currency": s["currency"],
                 "Price": round(price_num, 1),
@@ -521,6 +525,8 @@ if run:
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
         df = df.sort_values(["Region", "Company"])
 
+        # Display per region, keeping the new badge column
+        display_cols = ["Company","Manual","Price","5D % Change","YTD % Change"]
         for region in region_order:
             g = df[df["Region"] == region]
             if g.empty:
@@ -529,9 +535,9 @@ if run:
             curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
             header = f"{region} ({curr_label})" if curr_label else region
             st.subheader(header)
-            st.dataframe(g.drop(columns=["Region", "Currency"]), use_container_width=True)
+            st.dataframe(g[display_cols], use_container_width=True)
 
-        # CSV export
+        # CSV export (unchanged format; badge not included)
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
             "UK":      f"UK ({currency_symbol('GBp')})",
