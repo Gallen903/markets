@@ -130,37 +130,69 @@ def db_remove_stocks(tickers):
     conn.close()
 
 # -----------------------------
-# Finance helpers
+# Finance helpers (timezone-aware)
 # -----------------------------
 # Column selector: Yahoo (price return) uses 'Close'; total return uses 'Adj Close'
 def _col(use_price_return: bool) -> str:
     return "Close" if use_price_return else "Adj Close"
 
-def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp, use_price_return: bool):
+def _exchange_tz(ticker: str) -> str:
+    """Best-effort exchange timezone; fallback UTC."""
+    try:
+        tz = yf.Ticker(ticker).fast_info.get("timezone")
+        return tz or "UTC"
+    except Exception:
+        return "UTC"
+
+def _to_local_tz(df: pd.DataFrame, tz: str) -> pd.DataFrame:
+    """Ensure index is tz-aware and converted to the exchange's local tz."""
+    if df.empty:
+        return df
+    # Daily data from yfinance is often tz-naive; assume UTC then convert.
+    if df.index.tz is None:
+        df = df.tz_localize("UTC")
+    return df.tz_convert(tz)
+
+def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp, use_price_return: bool, tz: str):
     if tkr_hist.empty:
         return None, None
-    idx = tkr_hist.index[tkr_hist.index <= target_dt]
+    hist_local = _to_local_tz(tkr_hist, tz)
+    target_local_eod = pd.Timestamp(target_dt).tz_localize(tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    idx = hist_local.index[hist_local.index <= target_local_eod]
     if len(idx) == 0:
         return None, None
-    dt = idx[-1]
-    return float(tkr_hist.loc[dt, _col(use_price_return)]), dt
+    dt_local = idx[-1]
+    return float(hist_local.loc[dt_local, _col(use_price_return)]), dt_local
 
-def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: int, use_price_return: bool):
+def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt_local: pd.Timestamp, n: int, use_price_return: bool, tz: str):
     if tkr_hist.empty:
         return None
-    idx = tkr_hist.index[tkr_hist.index <= ref_dt]
+    hist_local = _to_local_tz(tkr_hist, tz)
+    idx = hist_local.index[hist_local.index <= ref_dt_local]
     if len(idx) <= n:
         return None
-    past_dt = idx[-(n+1)]
-    return float(tkr_hist.loc[past_dt, _col(use_price_return)])
+    past_dt_local = idx[-(n+1)]
+    return float(hist_local.loc[past_dt_local, _col(use_price_return)])
+
+def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str):
+    """Pick last trading close strictly before Jan 1 (LOCAL exchange time)."""
+    if tkr_hist.empty:
+        return None
+    hist_local = _to_local_tz(tkr_hist, tz)
+    cutoff_local = pd.Timestamp(f"{year}-01-01").tz_localize(tz)
+    idx = hist_local.index[hist_local.index < cutoff_local]
+    if len(idx) == 0:
+        return None
+    last_prev_year_local = idx[-1]
+    return float(hist_local.loc[last_prev_year_local, _col(use_price_return)])
 
 def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool):
+    """Fallback only (UTC-based window)."""
     start = f"{target_year-1}-12-01"
     end   = f"{target_year}-01-10"
     hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
     if hist.empty:
         return None
-    # pick last trading day in prior calendar year
     idx = hist.index[hist.index.year == (target_year - 1)]
     if len(idx) == 0:
         return float(hist.iloc[0][_col(use_price_return)])
@@ -169,20 +201,6 @@ def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool)
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
 
-# Same-frame YTD baseline to avoid EU/Dublin drift
-def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: bool):
-    """
-    Return the last price strictly before Jan 1 of `year` from the SAME history frame.
-    Uses 'Close' (price return) or 'Adj Close' (total return) based on toggle.
-    """
-    if tkr_hist.empty:
-        return None
-    # use calendar-year filter to dodge timezone quirks
-    idx = tkr_hist.index[tkr_hist.index.year == (year - 1)]
-    if len(idx) == 0:
-        return None
-    return float(tkr_hist.loc[idx[-1], _col(use_price_return)])
-
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -190,7 +208,7 @@ st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
 st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
 
-# Toggle: choose Yahoo-style (price return) vs total return (adj)
+# Toggle: Yahoo-style (Close) vs total return (Adj Close)
 use_price_return = st.toggle(
     "Match Yahoo Finance numbers (use Close → price return)",
     value=True,
@@ -251,7 +269,9 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Start mid-Dec prior year to ensure baseline candle exists; extend +7d past target
+            tz = _exchange_tz(tkr)
+
+            # Start mid-Dec prior year so the baseline candle exists in LOCAL time; extend +7 days after target
             hist = yf.download(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
@@ -262,25 +282,26 @@ if run:
             if hist.empty:
                 continue
 
-            price, p_dt = last_trading_close_on_or_before(hist, target_dt, use_price_return)
+            price, p_dt_local = last_trading_close_on_or_before(hist, target_dt, use_price_return, tz)
             if price is None:
                 continue
 
-            c_5ago = close_n_trading_days_ago(hist, p_dt, 5, use_price_return)
+            c_5ago = close_n_trading_days_ago(hist, p_dt_local, 5, use_price_return, tz)
             chg_5d = None
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
 
-            # Baseline from SAME frame (Yahoo-style if toggle is ON)
-            base = ytd_baseline_from_hist(hist, selected_date.year, use_price_return)
+            # YTD baseline from SAME frame using LOCAL cutoff (fixes IE/EU drift)
+            base = ytd_baseline_from_hist(hist, selected_date.year, use_price_return, tz)
             if base is None:
-                # Fallbacks if needed
+                # Fallbacks (rare)
                 base = prior_year_last_close(tkr, selected_date.year, use_price_return)
                 if base is None and not hist.empty:
-                    jan1 = pd.Timestamp(f"{selected_date.year}-01-01")
-                    later_idx = hist.index[hist.index >= jan1]
+                    jan1_local = pd.Timestamp(f"{selected_date.year}-01-01").tz_localize(tz)
+                    hist_local = _to_local_tz(hist, tz)
+                    later_idx = hist_local.index[hist_local.index >= jan1_local]
                     if len(later_idx) > 0:
-                        base = float(hist.loc[later_idx[0], _col(use_price_return)])
+                        base = float(hist_local.loc[later_idx[0], _col(use_price_return)])
 
             chg_ytd = (price - base) / base * 100.0 if base else None
 
@@ -298,7 +319,9 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"]).reset_index(drop=True)
+        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"]).reset_index(drop_by=True if hasattr(pd.DataFrame, "reset_index") else False)
+        if "index" in df.columns:
+            df = df.drop(columns=["index"])  # compatibility for older pandas
 
         region_order = ["Ireland", "UK", "Europe", "US"]
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
