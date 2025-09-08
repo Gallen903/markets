@@ -161,12 +161,19 @@ def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
     idx = pd.to_datetime(df.index)
     return np.array([d.date() for d in idx], dtype=object)
 
-def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
-    """Get last session's price on/before target_date using chosen column."""
+# --- Robust session lookup with +1 day grace ---
+from datetime import timedelta as _td
+
+def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool, grace_days: int = 1):
+    """
+    Find the last session on/before target_date, allowing a small forward grace window
+    to catch Friday bars that are stamped on Saturday (UTC roll).
+    """
     if df.empty:
         return None, None
     dates = _session_dates_index(df)
-    mask = dates <= target_date
+    cutoff = target_date + _td(days=grace_days)
+    mask = dates <= cutoff
     if not mask.any():
         return None, None
     pos = np.where(mask)[0][-1]
@@ -179,6 +186,23 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     if ref_pos < 0:
         return None
     return float(df.iloc[ref_pos][_col(use_price_return)])
+
+# --- Resilient fetch helper ---
+def fetch_hist(tkr: str, start, end):
+    hist = yf.download(
+        tkr,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    if hist is None or hist.empty:
+        try:
+            hist = yf.Ticker(tkr).history(start=start, end=end, interval="1d", actions=False, auto_adjust=False)
+        except Exception:
+            hist = pd.DataFrame()
+    return hist
 
 # --- Venue helpers for Yahoo parity (EU pre-holiday + adjusted series) ---
 EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
@@ -222,7 +246,6 @@ def yahoo_ytd_via_chart(
     Numerator: last value on/ before `on_date` (or live price if today & series=='close' & enabled)
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    # 2y to ensure we include prior-year EOY sessions
     params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
     data = _http_get_json(url, params)
     if not data:
@@ -238,7 +261,6 @@ def yahoo_ytd_via_chart(
         closes = q.get("close", []) or []
         adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
 
-        # Select series
         vec = adjc if (series == "adjclose" and len(adjc) == len(stamps)) else closes
         if not stamps or not vec:
             return None
@@ -263,7 +285,6 @@ def yahoo_ytd_via_chart(
             jan1 = date(year, 1, 1)
             prev = [val for d, val in dcs if d < jan1]
             if not prev:
-                # fallback: first available in-year
                 in_year = [val for d, val in dcs if d >= jan1]
                 if not in_year:
                     return None
@@ -369,19 +390,17 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Pull enough history for 5D calculation and display; session-date indexing
-            hist = yf.download(
+            # Pull enough history for 5D calculation and display; session-date indexing (resilient fetch)
+            hist = fetch_hist(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
                 end=selected_date + timedelta(days=7),
-                progress=False,
-                auto_adjust=False,
             )
             if hist.empty:
                 continue
 
-            # Last session on/before selected date (for display & 5D reference)
-            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
+            # Last session on/before selected date (grace +1 day)
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return, grace_days=1)
             if pos is None:
                 continue
 
