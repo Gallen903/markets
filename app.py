@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta, date
 import sqlite3
@@ -7,6 +8,20 @@ import io
 import csv
 from pathlib import Path
 from typing import Optional
+
+# --- HTTP (requests preferred; fallback to stdlib urllib) ---
+try:
+    import requests
+    _HTTP_LIB = "requests"
+except Exception:
+    import urllib.request, urllib.parse
+    _HTTP_LIB = "urllib"
+
+# --- Timezone helper (ZoneInfo on Python 3.9+) ---
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # fallback to UTC if not available
 
 DB_PATH = "stocks.db"
 
@@ -27,7 +42,7 @@ def init_db_with_defaults():
             currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
-    # Seed defaults without overwriting user entries (idempotent)
+    # Seed defaults WITHOUT overwriting user entries
     defaults = [
         # --- US ---
         ("STT","State Street Corporation","US","USD"),
@@ -132,101 +147,141 @@ def db_remove_stocks(tickers):
     conn.close()
 
 # -----------------------------
-# Finance helpers (timezone-aware)
+# Helpers for prices/returns
 # -----------------------------
-def _col(use_price_return: bool) -> str:
-    # Yahoo site YTD == price return => use 'Close'; 'Adj Close' for total return
-    return "Close" if use_price_return else "Adj Close"
-
-def _exchange_tz(ticker: str) -> str:
-    """Best-effort exchange timezone; fallback UTC."""
-    try:
-        tz = yf.Ticker(ticker).fast_info.get("timezone")
-        return tz or "UTC"
-    except Exception:
-        return "UTC"
-
-def _to_local_tz(df: pd.DataFrame, tz: str) -> pd.DataFrame:
-    """Ensure index is tz-aware and converted to the exchange's local tz."""
-    if df.empty:
-        return df
-    idx = df.index
-    # yfinance daily data may be tz-naive; assume UTC if naive, then convert
-    if getattr(idx, "tz", None) is None:
-        df = df.tz_localize("UTC")
-    return df.tz_convert(tz)
-
-def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp, use_price_return: bool, tz: str):
-    if tkr_hist.empty:
-        return None, None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    # interpret the chosen date in local time (end-of-day)
-    target_local_eod = pd.Timestamp(target_dt).tz_localize(tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    idx = hist_local.index[hist_local.index <= target_local_eod]
-    if len(idx) == 0:
-        return None, None
-    dt_local = idx[-1]
-    return float(hist_local.loc[dt_local, _col(use_price_return)]), dt_local
-
-def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt_local: pd.Timestamp, n: int, use_price_return: bool, tz: str):
-    if tkr_hist.empty:
-        return None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    idx = hist_local.index[hist_local.index <= ref_dt_local]
-    if len(idx) <= n:
-        return None
-    past_dt_local = idx[-(n+1)]
-    return float(hist_local.loc[past_dt_local, _col(use_price_return)])
-
-def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str):
-    """Pick last trading close strictly before Jan 1 (LOCAL exchange time)."""
-    if tkr_hist.empty:
-        return None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    cutoff_local = pd.Timestamp(f"{year}-01-01").tz_localize(tz)
-    idx = hist_local.index[hist_local.index < cutoff_local]
-    if len(idx) == 0:
-        return None
-    last_prev_year_local = idx[-1]
-    return float(hist_local.loc[last_prev_year_local, _col(use_price_return)])
-
-def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool):
-    """Fallback only (UTC-based window)."""
-    start = f"{target_year-1}-12-01"
-    end   = f"{target_year}-01-10"
-    hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
-    if hist.empty:
-        return None
-    idx = hist.index[hist.index.year == (target_year - 1)]
-    if len(idx) == 0:
-        return float(hist.iloc[0][_col(use_price_return)])
-    return float(hist.loc[idx[-1], _col(use_price_return)])
-
-def _live_price(ticker: str) -> Optional[float]:
-    """Yahoo-style 'regular market' price for today."""
-    try:
-        fi = yf.Ticker(ticker).fast_info
-        p = fi.get("last_price") or fi.get("regular_market_price")
-        return float(p) if p is not None else None
-    except Exception:
-        return None
-
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
+
+def _col(use_price_return: bool) -> str:
+    # Yahoo UI uses price return => 'Close'; total return => 'Adj Close'
+    return "Close" if use_price_return else "Adj Close"
+
+def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
+    """Return array of date() for each row; treat rows as local session dates."""
+    idx = pd.to_datetime(df.index)
+    return np.array([d.date() for d in idx], dtype=object)
+
+def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
+    """Get last session's price on/before target_date using chosen column."""
+    if df.empty:
+        return None, None
+    dates = _session_dates_index(df)
+    mask = dates <= target_date
+    if not mask.any():
+        return None, None
+    pos = np.where(mask)[0][-1]
+    return float(df.iloc[pos][_col(use_price_return)]), pos
+
+def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
+    if df.empty or pos is None:
+        return None
+    ref_pos = pos - n
+    if ref_pos < 0:
+        return None
+    return float(df.iloc[ref_pos][_col(use_price_return)])
+
+# -----------------------------
+# OPTION A: Yahoo chart endpoint for exact YTD
+# -----------------------------
+def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        if _HTTP_LIB == "requests":
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        else:
+            full = f"{url}?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(full, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                import json
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
+    """
+    Compute YTD % using Yahoo's own chart data (daily 'close' series).
+    Baseline: last close BEFORE Jan 1 of `year` (local to exchange).
+    Numerator: last close ON/BEFORE `on_date` (or live price if today & requested).
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    # Use 2y to ensure we capture prior-year EOY sessions for baseline
+    params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
+    data = _http_get_json(url, params)
+    if not data:
+        return None
+    try:
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        tzname = meta.get("exchangeTimezoneName", "UTC")
+        tz = ZoneInfo(tzname) if ZoneInfo else None
+
+        stamps = result.get("timestamp", []) or []
+        closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
+        if not stamps or not closes:
+            return None
+
+        dcs = []
+        for t, c in zip(stamps, closes):
+            if c is None:
+                continue
+            dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
+            dcs.append((dt.date(), float(c)))
+        if not dcs:
+            return None
+
+        # Baseline: last date strictly before Jan 1 of `year`
+        jan1 = date(year, 1, 1)
+        prior = [c for d, c in dcs if d < jan1]
+        if not prior:
+            # fallback: baseline = first available in the year
+            in_year = [c for d, c in dcs if d >= jan1]
+            if not in_year:
+                return None
+            base = in_year[0]
+        else:
+            base = prior[-1]
+
+        # Value for on_date (latest <= on_date)
+        last_vals = [c for d, c in dcs if d <= on_date]
+        if not last_vals:
+            return None
+        last_close = last_vals[-1]
+
+        # Optional: use live when on_date == today (mirrors Yahoo summary)
+        if use_live_when_today and on_date == date.today():
+            try:
+                fi = yf.Ticker(symbol).fast_info
+                live = fi.get("last_price") or fi.get("regular_market_price")
+                if live is not None:
+                    last_close = float(live)
+            except Exception:
+                pass
+
+        if base == 0:
+            return None
+        return (last_close - base) / base * 100.0
+    except Exception:
+        return None
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
+st.caption("Last price, 5-day % change, and YTD % change. YTD can be computed from Yahoo's chart feed for exact parity.")
 
-# Toggle: Yahoo-style (Close) vs total return (Adj Close)
+# Toggles
 use_price_return = st.toggle(
-    "Match Yahoo Finance numbers (use Close → price return, live price if today)",
+    "Match Yahoo style for returns (use Close; live price if today)",
     value=True,
-    help="ON = Yahoo-style price return (Close) and uses live price for today's YTD. "
-         "OFF = total return using Adj Close (dividends & splits), end-of-day only."
+    help="ON = price return (Close). OFF = total return (Adj Close). Live price used for today's numerator."
+)
+exact_yahoo_mode = st.toggle(
+    "Exact Yahoo YTD (chart feed)",
+    value=True,
+    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
 )
 
 init_db_with_defaults()
@@ -279,14 +334,13 @@ selected_stocks = [stock_options[label] for label in sel_labels]
 if run:
     rows = []
     target_dt = pd.to_datetime(selected_date)
-    today_dt = pd.to_datetime(date.today())
+    target_date = target_dt.date()
+    today_date = date.today()
 
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            tz = _exchange_tz(tkr)
-
-            # Start mid-Dec prior year so the baseline candle exists in LOCAL time; extend +7 days after target
+            # Pull enough history for 5D calculation and display; session-date indexing
             hist = yf.download(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
@@ -297,41 +351,45 @@ if run:
             if hist.empty:
                 continue
 
-            # Always get the last *close* on/before the selected date (for indexing/5D ref)
-            close_price_eod, p_dt_local_eod = last_trading_close_on_or_before(hist, target_dt, use_price_return, tz)
-            if p_dt_local_eod is None:
+            # Last session on/before selected date (for display & 5D reference)
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
+            if pos is None:
                 continue
 
-            # If matching Yahoo and the selected date is *today*, use LIVE price as the numerator
-            use_live = use_price_return and (target_dt.normalize() == today_dt.normalize())
-            live_price = _live_price(tkr) if use_live else None
-            price = float(live_price) if (live_price is not None) else float(close_price_eod)
+            # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D/YTD numerators
+            use_live = use_price_return and (target_date == today_date)
+            live_price = None
+            if use_live:
+                try:
+                    fi = yf.Ticker(tkr).fast_info
+                    live_price = fi.get("last_price") or fi.get("regular_market_price")
+                except Exception:
+                    live_price = None
 
-            # 5D change uses the ref point N trading days before the last available close
-            c_5ago = close_n_trading_days_ago(hist, p_dt_local_eod, 5, use_price_return, tz)
+            # Numerator price (today's live if available; else EOD close)
+            price_num = float(live_price) if (live_price is not None) else float(price_eod)
+
+            # 5D change uses n sessions back from the EOD position
+            c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
             chg_5d = None
             if c_5ago is not None and c_5ago != 0:
-                chg_5d = (price - c_5ago) / c_5ago * 100.0
+                chg_5d = (price_num - c_5ago) / c_5ago * 100.0
 
-            # YTD baseline from SAME frame using LOCAL cutoff (fixes IE/EU drift)
-            base = ytd_baseline_from_hist(hist, selected_date.year, use_price_return, tz)
-            if base is None:
-                # Fallbacks (rare)
-                base = prior_year_last_close(tkr, selected_date.year, use_price_return)
-                if base is None:
-                    jan1_local = pd.Timestamp(f"{selected_date.year}-01-01").tz_localize(tz)
-                    hist_local = _to_local_tz(hist, tz)
-                    later_idx = hist_local.index[hist_local.index >= jan1_local]
-                    if len(later_idx) > 0:
-                        base = float(hist_local.loc[later_idx[0], _col(use_price_return)])
-
-            chg_ytd = (price - base) / base * 100.0 if base else None
+            # YTD %
+            if exact_yahoo_mode:
+                chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
+            else:
+                # Fallback to internal computation (using prior-year last session as baseline)
+                dates = _session_dates_index(hist)
+                mask_prev = dates <= date(selected_date.year - 1, 12, 31)
+                base = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
+                chg_ytd = ((price_num - base) / base * 100.0) if base else None
 
             rows.append({
                 "Company": s["name"],
                 "Region": s["region"],
                 "Currency": s["currency"],
-                "Price": round(price, 1),
+                "Price": round(price_num, 1),
                 "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
                 "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
             })
