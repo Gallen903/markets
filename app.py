@@ -334,4 +334,67 @@ if run:
                     mask = dates >= date(selected_date.year, 1, 1)
                     if mask.any():
                         first_pos = np.where(mask)[0][0]
-                        base = float(hist.i
+                        base = float(hist.iloc[first_pos][_col(use_price_return)])
+
+            chg_ytd = (price - base) / base * 100.0 if base else None
+
+            rows.append({
+                "Company": s["name"],
+                "Region": s["region"],
+                "Currency": s["currency"],
+                "Price": round(price, 1),
+                "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
+                "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        st.warning("No stock data available for that date.")
+    else:
+        # build & sort the result table
+        df = (
+            pd.DataFrame(rows)
+              .sort_values(by=["Region", "Company"])
+              .reset_index(drop=True)
+        )
+
+        region_order = ["Ireland", "UK", "Europe", "US"]
+        df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
+        df = df.sort_values(["Region", "Company"])
+
+        for region in region_order:
+            g = df[df["Region"] == region]
+            if g.empty:
+                continue
+            currs = g["Currency"].unique().tolist()
+            curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
+            header = f"{region} ({curr_label})" if curr_label else region
+            st.subheader(header)
+            st.dataframe(g.drop(columns=["Region", "Currency"]), use_container_width=True)
+
+        # CSV export
+        REGION_LABELS = {
+            "Ireland": f"Ireland ({currency_symbol('EUR')})",
+            "UK":      f"UK ({currency_symbol('GBp')})",
+            "Europe":  f"Europe ({currency_symbol('EUR')})",
+            "US":      f"US ({currency_symbol('USD')})",
+        }
+
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
+        for region in region_order:
+            g = df[df["Region"] == region]
+            if g.empty:
+                continue
+            writer.writerow([REGION_LABELS[region], "Last price", "5D %change", "YTD % change"])
+            for _, row in g.iterrows():
+                company = (row["Company"] or "").replace(",", "")
+                price = f"{row['Price']:.1f}" if pd.notnull(row["Price"]) else ""
+                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row["5D % Change"]) else ""
+                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row["YTD % Change"]) else ""
+                writer.writerow([company, price, c5, cy])
+
+        csv_bytes = "\ufeff" + output.getvalue()
+        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
