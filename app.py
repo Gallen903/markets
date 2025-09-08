@@ -6,6 +6,7 @@ import sqlite3
 import io
 import csv
 from pathlib import Path
+from typing import Optional
 
 DB_PATH = "stocks.db"
 
@@ -26,83 +27,84 @@ def init_db_with_defaults():
             currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
-    # Only seed if empty
-    cur.execute("SELECT COUNT(*) FROM stocks")
-    if cur.fetchone()[0] == 0:
-        defaults = [
-            # --- US ---
-            ("STT","State Street Corporation","US","USD"),
-            ("PFE","Pfizer Inc.","US","USD"),
-            ("SBUX","Starbucks Corporation","US","USD"),
-            ("PEP","PepsiCo, Inc.","US","USD"),
-            ("ORCL","Oracle Corporation","US","USD"),
-            ("NVS","Novartis AG","US","USD"),
-            ("META","Meta Platforms, Inc.","US","USD"),
-            ("MSFT","Microsoft Corporation","US","USD"),
-            ("MRK","Merck & Co., Inc.","US","USD"),
-            ("JNJ","Johnson & Johnson","US","USD"),
-            ("INTC","Intel Corporation","US","USD"),
-            ("ICON","Icon Energy Corp.","US","USD"),
-            ("HPQ","HP Inc.","US","USD"),
-            ("GE","GE Aerospace","US","USD"),
-            ("LLY","Eli Lilly and Company","US","USD"),
-            ("EBAY","eBay Inc.","US","USD"),
-            ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
-            ("BSX","Boston Scientific Corporation","US","USD"),
-            ("AAPL","Apple Inc.","US","USD"),
-            ("AMGN","Amgen Inc.","US","USD"),
-            ("ADI","Analog Devices, Inc.","US","USD"),
-            ("ABBV","AbbVie Inc.","US","USD"),
-            ("GOOG","Alphabet Inc.","US","USD"),
-            ("ABT","Abbott Laboratories","US","USD"),
-            ("CRH","CRH plc","US","USD"),
-            ("SW","Smurfit Westrock Plc","US","USD"),
-            ("DEO","Diageo","US","USD"),
-            ("AER","AerCap Holdings","US","USD"),
-            ("FLUT","Flutter Entertainment plc","US","USD"),
+    # Seed defaults without overwriting user entries (idempotent)
+    defaults = [
+        # --- US ---
+        ("STT","State Street Corporation","US","USD"),
+        ("PFE","Pfizer Inc.","US","USD"),
+        ("SBUX","Starbucks Corporation","US","USD"),
+        ("PEP","PepsiCo, Inc.","US","USD"),
+        ("ORCL","Oracle Corporation","US","USD"),
+        ("NVS","Novartis AG","US","USD"),
+        ("META","Meta Platforms, Inc.","US","USD"),
+        ("MSFT","Microsoft Corporation","US","USD"),
+        ("MRK","Merck & Co., Inc.","US","USD"),
+        ("JNJ","Johnson & Johnson","US","USD"),
+        ("INTC","Intel Corporation","US","USD"),
+        ("ICON","Icon Energy Corp.","US","USD"),
+        ("HPQ","HP Inc.","US","USD"),
+        ("GE","GE Aerospace","US","USD"),
+        ("LLY","Eli Lilly and Company","US","USD"),
+        ("EBAY","eBay Inc.","US","USD"),
+        ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
+        ("BSX","Boston Scientific Corporation","US","USD"),
+        ("AAPL","Apple Inc.","US","USD"),
+        ("AMGN","Amgen Inc.","US","USD"),
+        ("ADI","Analog Devices, Inc.","US","USD"),
+        ("ABBV","AbbVie Inc.","US","USD"),
+        ("GOOG","Alphabet Inc.","US","USD"),
+        ("ABT","Abbott Laboratories","US","USD"),
+        ("CRH","CRH plc","US","USD"),
+        ("SW","Smurfit Westrock Plc","US","USD"),
+        ("DEO","Diageo","US","USD"),
+        ("AER","AerCap Holdings","US","USD"),
+        ("FLUT","Flutter Entertainment plc","US","USD"),
 
-            # --- Europe (non-UK, non-Ireland) ---
-            ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-            ("BSN.F","Danone S.A.","Europe","EUR"),
-            ("BKT.MC","Bankinter","Europe","EUR"),
+        # --- Europe (non-UK, non-Ireland) ---
+        ("HEIA.AS","Heineken N.V.","Europe","EUR"),
+        ("BSN.F","Danone S.A.","Europe","EUR"),
+        ("BKT.MC","Bankinter","Europe","EUR"),
 
-            # --- UK ---
-            ("VOD.L","Vodafone Group","UK","GBp"),
-            ("DCC.L","DCC plc","UK","GBp"),
-            ("GNCL.L","Greencore Group plc","UK","GBp"),
-            ("GFTUL.L","Grafton Group plc","UK","GBp"),
-            ("HVO.L","hVIVO plc","UK","GBp"),
-            ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-            ("TSCOL.L","Tesco plc","UK","GBp"),
-            ("BRBY.L","Burberry","UK","GBp"),
-            ("SSPG.L","SSP Group","UK","GBp"),
-            ("ABF.L","Associated British Foods","UK","GBp"),
-            ("GWMO.L","Great Western Mining Corp","UK","GBp"),
+        # --- UK ---
+        ("VOD.L","Vodafone Group","UK","GBp"),
+        ("DCC.L","DCC plc","UK","GBp"),
+        ("GNCL.XC","Greencore Group plc","UK","GBp"),
+        ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+        ("HVO.L","hVIVO plc","UK","GBp"),
+        ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
+        ("TSCOL.XC","Tesco plc","UK","GBp"),
+        ("BRBY.L","Burberry","UK","GBp"),
+        ("SSPG.L","SSP Group","UK","GBp"),
+        ("ABF.L","Associated British Foods","UK","GBp"),
+        ("GWMO.L","Great Western Mining Corp","UK","GBp"),
 
-            # --- Ireland ---
-            ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
-            ("UPR.IR","Uniphar plc","Ireland","EUR"),
-            ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
-            ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
-            ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
-            ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
-            ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
-            ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
-            ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
-            ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
-            ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
-            ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
-            ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
-            ("GL9.IR","Glanbia plc","Ireland","EUR"),
-            ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
-            ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
-            ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
-            ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
-            ("A5G.IR","AIB Group plc","Ireland","EUR"),
-            ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
-            ("YZA.IR","Arytza","Ireland","EUR"),
-        ]
-        cur.executemany("INSERT INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)", defaults)
+        # --- Ireland ---
+        ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
+        ("UPR.IR","Uniphar plc","Ireland","EUR"),
+        ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
+        ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
+        ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
+        ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
+        ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
+        ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
+        ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
+        ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
+        ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
+        ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
+        ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
+        ("GL9.IR","Glanbia plc","Ireland","EUR"),
+        ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
+        ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
+        ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
+        ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
+        ("A5G.IR","AIB Group plc","Ireland","EUR"),
+        ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
+        ("YZA.IR","Arytza","Ireland","EUR"),
+    ]
+    cur.executemany(
+        "INSERT OR IGNORE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
+        defaults
+    )
     conn.commit()
     conn.close()
 
@@ -132,8 +134,8 @@ def db_remove_stocks(tickers):
 # -----------------------------
 # Finance helpers (timezone-aware)
 # -----------------------------
-# Column selector: Yahoo (price return) uses 'Close'; total return uses 'Adj Close'
 def _col(use_price_return: bool) -> str:
+    # Yahoo site YTD == price return => use 'Close'; 'Adj Close' for total return
     return "Close" if use_price_return else "Adj Close"
 
 def _exchange_tz(ticker: str) -> str:
@@ -200,6 +202,15 @@ def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool)
         return float(hist.iloc[0][_col(use_price_return)])
     return float(hist.loc[idx[-1], _col(use_price_return)])
 
+def _live_price(ticker: str) -> Optional[float]:
+    """Yahoo-style 'regular market' price for today."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        p = fi.get("last_price") or fi.get("regular_market_price")
+        return float(p) if p is not None else None
+    except Exception:
+        return None
+
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
 
@@ -212,9 +223,10 @@ st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last t
 
 # Toggle: Yahoo-style (Close) vs total return (Adj Close)
 use_price_return = st.toggle(
-    "Match Yahoo Finance numbers (use Close → price return)",
+    "Match Yahoo Finance numbers (use Close → price return, live price if today)",
     value=True,
-    help="ON = Yahoo-style price return (Close). OFF = total return using Adj Close (dividends & splits)."
+    help="ON = Yahoo-style price return (Close) and uses live price for today's YTD. "
+         "OFF = total return using Adj Close (dividends & splits), end-of-day only."
 )
 
 init_db_with_defaults()
@@ -267,6 +279,7 @@ selected_stocks = [stock_options[label] for label in sel_labels]
 if run:
     rows = []
     target_dt = pd.to_datetime(selected_date)
+    today_dt = pd.to_datetime(date.today())
 
     for s in selected_stocks:
         tkr = s["ticker"]
@@ -284,11 +297,18 @@ if run:
             if hist.empty:
                 continue
 
-            price, p_dt_local = last_trading_close_on_or_before(hist, target_dt, use_price_return, tz)
-            if price is None:
+            # Always get the last *close* on/before the selected date (for indexing/5D ref)
+            close_price_eod, p_dt_local_eod = last_trading_close_on_or_before(hist, target_dt, use_price_return, tz)
+            if p_dt_local_eod is None:
                 continue
 
-            c_5ago = close_n_trading_days_ago(hist, p_dt_local, 5, use_price_return, tz)
+            # If matching Yahoo and the selected date is *today*, use LIVE price as the numerator
+            use_live = use_price_return and (target_dt.normalize() == today_dt.normalize())
+            live_price = _live_price(tkr) if use_live else None
+            price = float(live_price) if (live_price is not None) else float(close_price_eod)
+
+            # 5D change uses the ref point N trading days before the last available close
+            c_5ago = close_n_trading_days_ago(hist, p_dt_local_eod, 5, use_price_return, tz)
             chg_5d = None
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
@@ -298,7 +318,7 @@ if run:
             if base is None:
                 # Fallbacks (rare)
                 base = prior_year_last_close(tkr, selected_date.year, use_price_return)
-                if base is None and not hist.empty:
+                if base is None:
                     jan1_local = pd.Timestamp(f"{selected_date.year}-01-01").tz_localize(tz)
                     hist_local = _to_local_tz(hist, tz)
                     later_idx = hist_local.index[hist_local.index >= jan1_local]
@@ -321,7 +341,7 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        # build & sort the result table (fixed reset_index)
+        # build & sort the result table
         df = (
             pd.DataFrame(rows)
               .sort_values(by=["Region", "Company"])
