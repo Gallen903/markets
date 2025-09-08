@@ -86,7 +86,7 @@ def init_db_with_defaults():
         ("AER","AerCap Holdings","US","USD"),
         ("FLUT","Flutter Entertainment plc","US","USD"),
 
-        # --- Europe ---
+        # --- Europe (non-UK, non-Ireland) ---
         ("HEIA.AS","Heineken N.V.","Europe","EUR"),
         ("BSN.F","Danone S.A.","Europe","EUR"),
         ("BKT.MC","Bankinter","Europe","EUR"),
@@ -189,7 +189,7 @@ def _is_eu_like(ticker: str, region: str) -> bool:
 # -----------------------------
 # Yahoo chart JSON helpers
 # -----------------------------
-def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
+def _http_get_json(url: str, params: dict, timeout: float = 12.0) -> Optional[dict]:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         if _HTTP_LIB == "requests":
@@ -206,7 +206,7 @@ def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[di
         return None
 
 def chart_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    """Daily Close/Adj Close, indexed by **session date** (date, not datetime). Tight window."""
+    """Daily Close/Adj Close, indexed by SESSION DATE (date, not datetime). Tight window."""
     start_dt = pd.to_datetime(start_dt)
     end_dt = pd.to_datetime(end_dt)
     p1 = int((start_dt - timedelta(days=2)).timestamp())
@@ -221,8 +221,8 @@ def chart_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -
         tzname = result.get("meta", {}).get("exchangeTimezoneName", "UTC")
         tz = ZoneInfo(tzname) if ZoneInfo else None
         stamps = result.get("timestamp", []) or []
-        quote = result.get("indicators", {}).get("quote", [{}])[0]
-        closes = quote.get("close", []) or []
+        q = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = q.get("close", []) or []
         adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
         rows = []
         for i, t in enumerate(stamps):
@@ -235,69 +235,51 @@ def chart_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).drop_duplicates(subset=["Session"], keep="last").set_index("Session")
-        df.index = pd.to_datetime(df.index).date  # ensure index is date objects
-        # Trim strictly to our window
+        df.index = pd.to_datetime(df.index).date
+        # Trim strictly to window
         mask = (pd.Series(df.index) >= start_dt.date()) & (pd.Series(df.index) <= end_dt.date())
         return df.loc[mask.values]
     except Exception:
         return pd.DataFrame()
 
-def get_series(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    """
-    Prefer yfinance (Close + Adj Close), trimmed, indexed by **session date**.
-    If empty or missing fields, fall back to chart_series_df. Never returns future rows beyond end_dt.
-    """
-    # yfinance
+def yf_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+    """Use yfinance daily, index by SESSION DATE, return Close/Adj Close only."""
     try:
-        yf_df = yf.download(symbol, start=start_dt, end=end_dt + timedelta(days=1), progress=False, auto_adjust=False, threads=False)
+        raw = yf.download(symbol, start=start_dt, end=end_dt + timedelta(days=1), progress=False, auto_adjust=False, threads=False)
     except Exception:
-        yf_df = pd.DataFrame()
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    keep = [c for c in ["Close","Adj Close"] if c in raw.columns]
+    if not keep:
+        return pd.DataFrame()
+    df = raw[keep].copy()
+    idx_dates = pd.to_datetime(df.index).date
+    df.insert(0, "Session", idx_dates)
+    df = df.drop_duplicates(subset=["Session"], keep="last").set_index("Session")
+    mask = (pd.Series(df.index) >= pd.to_datetime(start_dt).date()) & (pd.Series(df.index) <= pd.to_datetime(end_dt).date())
+    df = df.loc[mask.values]
+    # Ensure both columns exist
+    if "Close" not in df.columns: df["Close"] = np.nan
+    if "Adj Close" not in df.columns: df["Adj Close"] = np.nan
+    return df
 
-    def to_session_df(raw: pd.DataFrame) -> pd.DataFrame:
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-        # Normalize columns
-        if isinstance(raw.columns, pd.MultiIndex):
-            # Single ticker expected => flatten if possible
-            try:
-                raw = raw.swaplevel(axis=1).sort_index(axis=1)
-                # take fields if present
-                cols = {}
-                for f in ["Close", "Adj Close"]:
-                    for t in raw.columns.levels[0]:
-                        if (t, f) in raw.columns:
-                            cols[f] = raw[(t, f)]
-                            break
-                if not cols:
-                    return pd.DataFrame()
-                df = pd.concat(cols, axis=1)
-            except Exception:
-                return pd.DataFrame()
-        else:
-            keep = [c for c in ["Close", "Adj Close"] if c in raw.columns]
-            if not keep:
-                return pd.DataFrame()
-            df = raw[keep]
-        # Index to session date and trim
-        idx_dates = pd.to_datetime(df.index).date
-        df = df.copy()
-        df.insert(0, "Session", idx_dates)
-        df = df.drop_duplicates(subset=["Session"], keep="last").set_index("Session")
-        # strict trim
-        mask = (pd.Series(df.index) >= start_dt.date()) & (pd.Series(df.index) <= end_dt.date())
-        return df.loc[mask.values]
-
-    df_yf = to_session_df(yf_df)
-    if df_yf is not None and not df_yf.empty:
-        # Ensure both columns exist
-        if "Adj Close" not in df_yf.columns:
-            df_yf["Adj Close"] = np.nan
-        if "Close" not in df_yf.columns:
-            df_yf["Close"] = np.nan
-        return df_yf
-
-    # Fall back to chart
-    return chart_series_df(symbol, start_dt, end_dt)
+def get_series(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp, prefer_chart: bool) -> pd.DataFrame:
+    """Prefer chart feed for EU/IR; otherwise try yfinance then chart. Never returns future rows."""
+    if prefer_chart:
+        df = chart_series_df(symbol, start_dt, end_dt)
+        if df is None or df.empty:
+            df = yf_series_df(symbol, start_dt, end_dt)
+    else:
+        df = yf_series_df(symbol, start_dt, end_dt)
+        if df is None or df.empty:
+            df = chart_series_df(symbol, start_dt, end_dt)
+    # Final safety: guarantee both columns exist
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "Close" not in df.columns: df["Close"] = np.nan
+    if "Adj Close" not in df.columns: df["Adj Close"] = np.nan
+    return df
 
 # -----------------------------
 # Streamlit UI
@@ -356,59 +338,6 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             conn_rm.commit(); conn_rm.close()
             st.success(f"Removed {len(tickers)} stock(s)")
 
-# ---- Manual YTD baselines
-with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
-    cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
-    st.caption("Define the **baseline price** used for YTD % for that ticker in this year (EUR/GBp/USD).")
-
-    c1, c2, c3, c4 = st.columns([1.2, 0.8, 0.8, 1])
-    with c1: b_ticker = st.text_input("Ticker (exact)", placeholder="A5G.IR")
-    with c2: b_price  = st.text_input("Baseline price", placeholder="e.g. 4.25")
-    with c3: b_series = st.selectbox("Series", ["close","adjclose"])
-    with c4: b_date   = st.text_input("Baseline date (optional, yyyy-mm-dd)", placeholder="2024-12-27")
-    b_notes = st.text_input("Notes (optional)", placeholder="e.g. Dec 27 adjclose from Yahoo")
-
-    if st.button("Add / Update baseline"):
-        try:
-            db_set_reference(b_ticker, int(cur_year), float(b_price), b_date.strip() or None, b_series, b_notes.strip() or None)
-            st.success(f"Baseline saved for {b_ticker} ({cur_year}): {b_price}")
-        except Exception as e:
-            st.error(f"Could not save baseline: {e}")
-
-    st.markdown("**Bulk import / export** (CSV: ticker,year,price,date,series,notes)")
-    up = st.file_uploader("Upload CSV", type=["csv"])
-    if up is not None:
-        try:
-            imp = pd.read_csv(up)
-            for _, r in imp.iterrows():
-                db_set_reference(
-                    str(r.get("ticker")), int(r.get("year")), float(r.get("price")),
-                    None if pd.isna(r.get("date")) else str(r.get("date")),
-                    None if pd.isna(r.get("series")) else str(r.get("series")),
-                    None if pd.isna(r.get("notes")) else str(r.get("notes")),
-                )
-            st.success(f"Imported/updated {len(imp)} baseline(s).")
-        except Exception as e:
-            st.error(f"Import failed: {e}")
-
-    refs_df = db_all_references(cur_year).sort_values(["ticker","year"])
-    st.dataframe(refs_df, use_container_width=True)
-    if not refs_df.empty:
-        out_csv = io.StringIO(); refs_df.to_csv(out_csv, index=False)
-        st.download_button("⬇️ Download current year's baselines CSV", data=out_csv.getvalue(),
-                           file_name=f"ytd_baselines_{cur_year}.csv", mime="text/csv")
-
-        del_opts = [f"{r['ticker']} ({r['year']})" for _, r in refs_df.iterrows()]
-        del_sel = st.multiselect("Delete baselines", del_opts, [])
-        if st.button("Delete selected baselines"):
-            keys = []
-            for s in del_sel:
-                t = s[:s.rfind("(")].strip()
-                y = int(s[s.rfind("(")+1:-1])
-                keys.append((t,y))
-            db_delete_references(keys)
-            st.success(f"Deleted {len(keys)} baseline(s).")
-
 # ----- Selection
 stocks_df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", get_conn())
 stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
@@ -430,24 +359,31 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Build a clean daily series (session-date index) for Close + Adj Close
-            series_df = get_series(tkr, pd.to_datetime(window_start), pd.to_datetime(window_end))
+            prefer_chart = _is_eu_like(tkr, s["region"])
+            series_df = get_series(tkr, pd.to_datetime(window_start), pd.to_datetime(window_end), prefer_chart=prefer_chart)
             if series_df is None or series_df.empty:
                 continue
 
-            # Pick the session on/before selected date (with grace)
             sessions = pd.Index(series_df.index)
+            if len(sessions) == 0:
+                continue
+            # last session <= selected_date + grace
             mask = sessions <= pd.to_datetime(window_end).date()
             if not mask.any():
                 continue
             pos = np.where(mask)[0][-1]
 
-            # Determine displayed price (EOD for selected session; live ONLY if selected_date == today)
-            price_eod_close = float(series_df.iloc[pos]["Close"]) if pd.notnull(series_df.iloc[pos]["Close"]) else None
-            price_eod_adj   = float(series_df.iloc[pos]["Adj Close"]) if pd.notnull(series_df.iloc[pos]["Adj Close"]) else None
+            # Choose a price EVEN IF one series is missing
+            close_val = series_df.iloc[pos]["Close"] if "Close" in series_df.columns else np.nan
+            adj_val   = series_df.iloc[pos]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
 
-            price_eod = price_eod_close if use_price_return else (price_eod_adj if price_eod_adj is not None else price_eod_close)
+            def pick_price(prefer_close: bool, c, a):
+                if prefer_close:
+                    return float(c) if pd.notnull(c) else (float(a) if pd.notnull(a) else None)
+                else:
+                    return float(a) if pd.notnull(a) else (float(c) if pd.notnull(c) else None)
 
+            price_eod = pick_price(use_price_return, close_val, adj_val)
             if price_eod is None:
                 continue
 
@@ -461,15 +397,15 @@ if run:
                 except Exception:
                     pass
 
-            # 5D change
+            # 5D change (use SAME selection rule as price)
             ref_pos = pos - 5
             chg_5d = None
             if ref_pos >= 0:
-                ref_val_close = series_df.iloc[ref_pos]["Close"]
-                ref_val_adj   = series_df.iloc[ref_pos]["Adj Close"]
-                ref_val = ref_val_close if use_price_return else (ref_val_adj if pd.notnull(ref_val_adj) else ref_val_close)
-                if pd.notnull(ref_val) and ref_val != 0:
-                    chg_5d = (price_num - float(ref_val)) / float(ref_val) * 100.0
+                rv_close = series_df.iloc[ref_pos]["Close"] if "Close" in series_df.columns else np.nan
+                rv_adj   = series_df.iloc[ref_pos]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
+                ref_val = pick_price(use_price_return, rv_close, rv_adj)
+                if ref_val is not None and ref_val != 0:
+                    chg_5d = (price_num - ref_val) / ref_val * 100.0
 
             # YTD change
             chg_ytd = None
@@ -479,26 +415,34 @@ if run:
                 if base:
                     chg_ytd = (price_num - float(base)) / float(base) * 100.0
             else:
-                # Auto baseline from the same series_df
-                eu_like = _is_eu_like(tkr, s["Region"])
-                if eu_like:
-                    # Yahoo-like EU: use Adj Close and an anchor <= Dec 27
+                # Auto baseline from same series
+                if prefer_chart:
+                    # EU/IR: Yahoo-like – use Adj Close if available, anchor <= Dec 27
                     cutoff = date(selected_date.year - 1, 12, 27)
-                    prev_idx = [i for i, d in enumerate(series_df.index) if d <= cutoff]
-                    if prev_idx:
-                        base_val = series_df.iloc[prev_idx[-1]]["Adj Close"]
+                    idxs = [i for i, d in enumerate(series_df.index) if d <= cutoff]
+                    if idxs:
+                        base_c = series_df.iloc[idxs[-1]]["Close"] if "Close" in series_df.columns else np.nan
+                        base_a = series_df.iloc[idxs[-1]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
+                        base_val = pick_price(False, base_c, base_a)  # prefer adj for EU
                     else:
                         base_val = np.nan
                 else:
-                    # Standard: last session strictly before Jan 1, using Close
+                    # Others: price-return baseline = last session strictly before Jan 1 using Close (fall back to Adj if Close missing)
                     jan1 = date(selected_date.year, 1, 1)
-                    prev_idx = [i for i, d in enumerate(series_df.index) if d < jan1]
-                    if prev_idx:
-                        base_val = series_df.iloc[prev_idx[-1]]["Close"]
+                    idxs = [i for i, d in enumerate(series_df.index) if d < jan1]
+                    if idxs:
+                        base_c = series_df.iloc[idxs[-1]]["Close"] if "Close" in series_df.columns else np.nan
+                        base_a = series_df.iloc[idxs[-1]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
+                        base_val = pick_price(True, base_c, base_a)   # prefer close
                     else:
-                        # if no prior, take first in-year
+                        # if no prior session, take first in-year with same preference
                         in_idx = [i for i, d in enumerate(series_df.index) if d >= jan1]
-                        base_val = series_df.iloc[in_idx[0]]["Close"] if in_idx else np.nan
+                        if in_idx:
+                            base_c = series_df.iloc[in_idx[0]]["Close"] if "Close" in series_df.columns else np.nan
+                            base_a = series_df.iloc[in_idx[0]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
+                            base_val = pick_price(True, base_c, base_a)
+                        else:
+                            base_val = np.nan
 
                 if pd.notnull(base_val) and float(base_val) != 0.0:
                     chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
