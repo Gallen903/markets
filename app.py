@@ -179,7 +179,7 @@ def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt_local: pd.Timestamp,
     return float(hist_local.loc[past_dt_local, _col(use_price_return)])
 
 def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str):
-    """Pick last trading close strictly before Jan 1 (LOCAL exchange time)."""
+    """Default: last trading close strictly before Jan 1 (LOCAL exchange time)."""
     if tkr_hist.empty:
         return None
     hist_local = _to_local_tz(tkr_hist, tz)
@@ -189,6 +189,37 @@ def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: 
         return None
     last_prev_year_local = idx[-1]
     return float(hist_local.loc[last_prev_year_local, _col(use_price_return)])
+
+# --- New: policy-based baseline (Euronext pre-holiday anchor) ---
+EURONEXT_TZS = {
+    "Europe/Dublin", "Europe/Paris", "Europe/Amsterdam", "Europe/Brussels",
+    "Europe/Lisbon", "Europe/Oslo", "Europe/Rome"
+}
+
+def ytd_baseline_from_hist_policy(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str, policy: str):
+    """
+    policy: 'last_trading_day' (default) or 'euronext_preholiday'
+    - last_trading_day: last row < Jan 1 local time
+    - euronext_preholiday: last row <= Dec 27 local time (mirrors Yahoo EU behavior some years)
+    """
+    if tkr_hist.empty:
+        return None
+    hist_local = _to_local_tz(tkr_hist, tz)
+
+    if policy == "euronext_preholiday":
+        cut = pd.Timestamp(f"{year-1}-12-27 23:59:59").tz_localize(tz)
+        prev = hist_local.loc[hist_local.index <= cut]
+        if not prev.empty:
+            dt = prev.index[-1]
+            return float(prev.loc[dt, _col(use_price_return)])
+        # fall back to standard if nothing <= Dec 27 (very unlikely)
+    # default / fallback
+    cutoff = pd.Timestamp(f"{year}-01-01").tz_localize(tz)
+    prev = hist_local.loc[hist_local.index < cutoff]
+    if prev.empty:
+        return None
+    dt = prev.index[-1]
+    return float(prev.loc[dt, _col(use_price_return)])
 
 def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool):
     """Fallback only (UTC-based window)."""
@@ -219,7 +250,7 @@ def currency_symbol(cur: str) -> str:
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
+st.caption("Last price, 5-day % change, YTD % change (YTD baseline policy varies by exchange).")
 
 # Toggle: Yahoo-style (Close) vs total return (Adj Close)
 use_price_return = st.toggle(
@@ -313,8 +344,11 @@ if run:
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
 
-            # YTD baseline from SAME frame using LOCAL cutoff (fixes IE/EU drift)
-            base = ytd_baseline_from_hist(hist, selected_date.year, use_price_return, tz)
+            # Decide baseline policy
+            policy = "euronext_preholiday" if (tz in EURONEXT_TZS and s["Region"] in ("Ireland", "Europe")) else "last_trading_day"
+
+            # YTD baseline from SAME frame using selected policy
+            base = ytd_baseline_from_hist_policy(hist, selected_date.year, use_price_return, tz, policy)
             if base is None:
                 # Fallbacks (rare)
                 base = prior_year_last_close(tkr, selected_date.year, use_price_return)
