@@ -69,11 +69,11 @@ def init_db_with_defaults():
             # --- UK ---
             ("VOD.L","Vodafone Group","UK","GBp"),
             ("DCC.L","DCC plc","UK","GBp"),
-            ("GNCL.XC","Greencore Group plc","UK","GBp"),
-            ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+            ("GNCL.L","Greencore Group plc","UK","GBp"),
+            ("GFTUL.L","Grafton Group plc","UK","GBp"),
             ("HVO.L","hVIVO plc","UK","GBp"),
             ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-            ("TSCOL.XC","Tesco plc","UK","GBp"),
+            ("TSCOL.L","Tesco plc","UK","GBp"),
             ("BRBY.L","Burberry","UK","GBp"),
             ("SSPG.L","SSP Group","UK","GBp"),
             ("ABF.L","Associated British Foods","UK","GBp"),
@@ -165,6 +165,20 @@ def prior_year_last_close(ticker: str, target_year: int):
 def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
 
+# NEW: derive YTD baseline from the SAME history frame to avoid timezone/series drift
+def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int):
+    """
+    Return the last 'Adj Close' strictly before Jan 1 of `year` from the SAME
+    history DataFrame used for current price. This avoids EU/Dublin drift.
+    """
+    if tkr_hist.empty:
+        return None
+    cutoff = pd.Timestamp(f"{year}-01-01")
+    idx = tkr_hist.index[tkr_hist.index < cutoff]
+    if len(idx) == 0:
+        return None
+    return float(tkr_hist.loc[idx[-1], "Adj Close"])
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -226,10 +240,11 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
+            # START earlier (Dec 15 of prior year) so the YTD baseline candle is present
             hist = yf.download(
                 tkr,
-                start=f"{selected_date.year}-01-01",
-                end=selected_date + timedelta(days=3),  # extend by 3 days
+                start=f"{selected_date.year-1}-12-15",
+                end=selected_date + timedelta(days=7),  # extend by 7 days
                 progress=False,
                 auto_adjust=False,
             )
@@ -245,9 +260,18 @@ if run:
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
 
-            base = prior_year_last_close(tkr, selected_date.year)
+            # YTD baseline from the SAME history (fixes Dublin/Europe drift)
+            base = ytd_baseline_from_hist(hist, selected_date.year)
             if base is None:
-                base = float(hist.iloc[0]["Adj Close"])
+                # Fallback: if prior-year candle missing in this frame, try original helper
+                base = prior_year_last_close(tkr, selected_date.year)
+                # Final fallback: first available adjusted close in this frame
+                if base is None and not hist.empty:
+                    jan1 = pd.Timestamp(f"{selected_date.year}-01-01")
+                    later_idx = hist.index[hist.index >= jan1]
+                    if len(later_idx) > 0:
+                        base = float(hist.loc[later_idx[0], "Adj Close"])
+
             chg_ytd = (price - base) / base * 100.0 if base else None
 
             rows.append({
