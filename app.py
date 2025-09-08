@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, date
 import sqlite3
 import io
 import csv
-from pathlib import Path
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
@@ -161,22 +160,23 @@ def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
     idx = pd.to_datetime(df.index)
     return np.array([d.date() for d in idx], dtype=object)
 
-# --- Robust session lookup with +1 day grace ---
-from datetime import timedelta as _td
-
-def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool, grace_days: int = 1):
+# --- Robust session lookup with wider grace (+3 days) and hard fallback ---
+def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool, grace_days: int = 3):
     """
-    Find the last session on/before target_date, allowing a small forward grace window
-    to catch Friday bars that are stamped on Saturday (UTC roll).
+    Find the last session on/before target_date, allowing a forward grace window
+    (to catch Friday bars stamped on Sat/Sun UTC). If still nothing, fall back to
+    the last available row in df.
     """
     if df.empty:
         return None, None
     dates = _session_dates_index(df)
-    cutoff = target_date + _td(days=grace_days)
+    cutoff = target_date + timedelta(days=grace_days)
     mask = dates <= cutoff
-    if not mask.any():
-        return None, None
-    pos = np.where(mask)[0][-1]
+    if mask.any():
+        pos = np.where(mask)[0][-1]
+        return float(df.iloc[pos][_col(use_price_return)]), pos
+    # HARD FALLBACK: use last available row
+    pos = len(df) - 1
     return float(df.iloc[pos][_col(use_price_return)]), pos
 
 def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
@@ -187,22 +187,42 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
         return None
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
-# --- Resilient fetch helper ---
+# --- Resilient fetch helper (triple fallback) ---
+def _trim_to_window(hist: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    idx = pd.to_datetime(hist.index)
+    mask = (idx >= start_dt) & (idx <= end_dt)
+    return hist.loc[mask] if mask.any() else hist
+
 def fetch_hist(tkr: str, start, end):
+    start_dt = pd.to_datetime(start)
+    end_dt   = pd.to_datetime(end)
+    # 1) download
     hist = yf.download(
         tkr,
-        start=start,
-        end=end,
+        start=start_dt,
+        end=end_dt,
         progress=False,
         auto_adjust=False,
         threads=False,
     )
-    if hist is None or hist.empty:
-        try:
-            hist = yf.Ticker(tkr).history(start=start, end=end, interval="1d", actions=False, auto_adjust=False)
-        except Exception:
-            hist = pd.DataFrame()
-    return hist
+    if hist is not None and not hist.empty:
+        return hist
+    # 2) history with start/end
+    try:
+        hist = yf.Ticker(tkr).history(start=start_dt, end=end_dt, interval="1d", actions=False, auto_adjust=False)
+        if hist is not None and not hist.empty:
+            return hist
+    except Exception:
+        pass
+    # 3) broader period, then trim locally
+    try:
+        hist = yf.Ticker(tkr).history(period="2y", interval="1d", actions=False, auto_adjust=False)
+        hist = _trim_to_window(hist, start_dt, end_dt)
+    except Exception:
+        hist = pd.DataFrame()
+    return hist if hist is not None else pd.DataFrame()
 
 # --- Venue helpers for Yahoo parity (EU pre-holiday + adjusted series) ---
 EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
@@ -390,7 +410,7 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Pull enough history for 5D calculation and display; session-date indexing (resilient fetch)
+            # Pull enough history for 5D calculation and display; resilient fetch
             hist = fetch_hist(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
@@ -399,10 +419,10 @@ if run:
             if hist.empty:
                 continue
 
-            # Last session on/before selected date (grace +1 day)
-            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return, grace_days=1)
+            # Last session on/before selected date (grace up to +3 days, with hard fallback)
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return, grace_days=3)
             if pos is None:
-                continue
+                continue  # (shouldn't happen with hard fallback, but keep guard)
 
             # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D numerators
             use_live = use_price_return and (target_date == today_date)
@@ -435,7 +455,7 @@ if run:
                     anchor_policy=policy
                 )
             else:
-                # Fallback to internal computation (prior-year last session baseline)
+                # Internal fallback: prior-year last session baseline (≤ Dec 31)
                 dates = _session_dates_index(hist)
                 mask_prev = dates <= date(selected_date.year - 1, 12, 31)
                 base = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
