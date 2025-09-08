@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta, date
 import sqlite3
@@ -132,109 +133,85 @@ def db_remove_stocks(tickers):
     conn.close()
 
 # -----------------------------
-# Finance helpers (timezone-aware)
+# Finance helpers (session-date based; no tz math)
 # -----------------------------
 def _col(use_price_return: bool) -> str:
     # Yahoo site YTD == price return => use 'Close'; 'Adj Close' for total return
     return "Close" if use_price_return else "Adj Close"
 
+def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
+    """Return an array of date() objects corresponding to each row (treat rows as local session dates)."""
+    idx = pd.to_datetime(df.index)
+    return np.array([d.date() for d in idx], dtype=object)
+
+def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
+    """Get last session's price on/before target_date using the chosen column."""
+    if df.empty:
+        return None, None
+    dates = _session_dates_index(df)
+    mask = dates <= target_date
+    if not mask.any():
+        return None, None
+    pos = np.where(mask)[0][-1]
+    return float(df.iloc[pos][_col(use_price_return)]), pos
+
+def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
+    """Get price n sessions before a given position."""
+    if df.empty or pos is None:
+        return None
+    ref_pos = pos - n
+    if ref_pos < 0:
+        return None
+    return float(df.iloc[ref_pos][_col(use_price_return)])
+
+# --- Baseline (policy): Euronext pre-holiday vs last trading day ---
+EURONEXT_TZS = {
+    # used only as a venue hint; we don't actually convert tz now
+    "Europe/Dublin", "Europe/Paris", "Europe/Amsterdam", "Europe/Brussels",
+    "Europe/Lisbon", "Europe/Oslo", "Europe/Rome"
+}
+
 def _exchange_tz(ticker: str) -> str:
-    """Best-effort exchange timezone; fallback UTC."""
+    """Best-effort exchange timezone; fallback 'UTC' (used only to decide Euronext policy)."""
     try:
         tz = yf.Ticker(ticker).fast_info.get("timezone")
         return tz or "UTC"
     except Exception:
         return "UTC"
 
-def _to_local_tz(df: pd.DataFrame, tz: str) -> pd.DataFrame:
-    """Ensure index is tz-aware and converted to the exchange's local tz."""
+def ytd_baseline_from_hist_policy(df: pd.DataFrame, year: int, use_price_return: bool, is_euronext_like: bool):
+    """Pick the baseline row by session date only (no tz)."""
     if df.empty:
-        return df
-    idx = df.index
-    # yfinance daily data may be tz-naive; assume UTC if naive, then convert
-    if getattr(idx, "tz", None) is None:
-        df = df.tz_localize("UTC")
-    return df.tz_convert(tz)
-
-def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp, use_price_return: bool, tz: str):
-    if tkr_hist.empty:
-        return None, None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    # interpret the chosen date in local time (end-of-day)
-    target_local_eod = pd.Timestamp(target_dt).tz_localize(tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    idx = hist_local.index[hist_local.index <= target_local_eod]
-    if len(idx) == 0:
-        return None, None
-    dt_local = idx[-1]
-    return float(hist_local.loc[dt_local, _col(use_price_return)]), dt_local
-
-def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt_local: pd.Timestamp, n: int, use_price_return: bool, tz: str):
-    if tkr_hist.empty:
         return None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    idx = hist_local.index[hist_local.index <= ref_dt_local]
-    if len(idx) <= n:
+    dates = _session_dates_index(df)
+    if is_euronext_like:
+        cutoff = date(year - 1, 12, 27)   # mirror Yahoo EU behavior you observed
+        mask = dates <= cutoff
+    else:
+        cutoff = date(year - 1, 12, 31)   # standard: last session of the year
+        mask = dates <= cutoff
+    if not mask.any():
         return None
-    past_dt_local = idx[-(n+1)]
-    return float(hist_local.loc[past_dt_local, _col(use_price_return)])
-
-def ytd_baseline_from_hist(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str):
-    """Default: last trading close strictly before Jan 1 (LOCAL exchange time)."""
-    if tkr_hist.empty:
-        return None
-    hist_local = _to_local_tz(tkr_hist, tz)
-    cutoff_local = pd.Timestamp(f"{year}-01-01").tz_localize(tz)
-    idx = hist_local.index[hist_local.index < cutoff_local]
-    if len(idx) == 0:
-        return None
-    last_prev_year_local = idx[-1]
-    return float(hist_local.loc[last_prev_year_local, _col(use_price_return)])
-
-# --- New: policy-based baseline (Euronext pre-holiday anchor) ---
-EURONEXT_TZS = {
-    "Europe/Dublin", "Europe/Paris", "Europe/Amsterdam", "Europe/Brussels",
-    "Europe/Lisbon", "Europe/Oslo", "Europe/Rome"
-}
-
-def ytd_baseline_from_hist_policy(tkr_hist: pd.DataFrame, year: int, use_price_return: bool, tz: str, policy: str):
-    """
-    policy: 'last_trading_day' (default) or 'euronext_preholiday'
-    - last_trading_day: last row < Jan 1 local time
-    - euronext_preholiday: last row <= Dec 27 local time (mirrors Yahoo EU behavior some years)
-    """
-    if tkr_hist.empty:
-        return None
-    hist_local = _to_local_tz(tkr_hist, tz)
-
-    if policy == "euronext_preholiday":
-        cut = pd.Timestamp(f"{year-1}-12-27 23:59:59").tz_localize(tz)
-        prev = hist_local.loc[hist_local.index <= cut]
-        if not prev.empty:
-            dt = prev.index[-1]
-            return float(prev.loc[dt, _col(use_price_return)])
-        # fall back to standard if nothing <= Dec 27 (very unlikely)
-    # default / fallback
-    cutoff = pd.Timestamp(f"{year}-01-01").tz_localize(tz)
-    prev = hist_local.loc[hist_local.index < cutoff]
-    if prev.empty:
-        return None
-    dt = prev.index[-1]
-    return float(prev.loc[dt, _col(use_price_return)])
+    pos = np.where(mask)[0][-1]
+    return float(df.iloc[pos][_col(use_price_return)])
 
 def prior_year_last_close(ticker: str, target_year: int, use_price_return: bool):
-    """Fallback only (UTC-based window)."""
+    """Fallback only; not usually needed now."""
     start = f"{target_year-1}-12-01"
     end   = f"{target_year}-01-10"
     hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
     if hist.empty:
         return None
-    idx = hist.index[hist.index.year == (target_year - 1)]
-    if len(idx) == 0:
+    # pick last session in prior year
+    idx = pd.to_datetime(hist.index)
+    mask = idx.year == (target_year - 1)
+    if not mask.any():
         return float(hist.iloc[0][_col(use_price_return)])
-    return float(hist.loc[idx[-1], _col(use_price_return)])
+    last_pos = np.where(mask)[0][-1]
+    return float(hist.iloc[last_pos][_col(use_price_return)])
 
 def _live_price(ticker: str) -> Optional[float]:
-    """Yahoo-style 'regular market' price for today."""
+    """Yahoo-style 'regular market' price for today (if available)."""
     try:
         fi = yf.Ticker(ticker).fast_info
         p = fi.get("last_price") or fi.get("regular_market_price")
@@ -310,14 +287,16 @@ selected_stocks = [stock_options[label] for label in sel_labels]
 if run:
     rows = []
     target_dt = pd.to_datetime(selected_date)
-    today_dt = pd.to_datetime(date.today())
+    target_date = target_dt.date()
+    today_date = date.today()
 
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            tz = _exchange_tz(tkr)
+            tz_hint = _exchange_tz(tkr)
+            is_euronext_like = (tz_hint in EURONEXT_TZS) and (s["Region"] in ("Ireland", "Europe"))
 
-            # Start mid-Dec prior year so the baseline candle exists in LOCAL time; extend +7 days after target
+            # Start mid-Dec prior year so the baseline row exists; extend +7 days after target
             hist = yf.download(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
@@ -328,96 +307,31 @@ if run:
             if hist.empty:
                 continue
 
-            # Always get the last *close* on/before the selected date (for indexing/5D ref)
-            close_price_eod, p_dt_local_eod = last_trading_close_on_or_before(hist, target_dt, use_price_return, tz)
-            if p_dt_local_eod is None:
+            # Last session on/before selected date
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
+            if pos is None:
                 continue
 
-            # If matching Yahoo and the selected date is *today*, use LIVE price as the numerator
-            use_live = use_price_return and (target_dt.normalize() == today_dt.normalize())
+            # If matching Yahoo and the selected date is today, prefer LIVE price
+            use_live = use_price_return and (target_date == today_date)
             live_price = _live_price(tkr) if use_live else None
-            price = float(live_price) if (live_price is not None) else float(close_price_eod)
+            price = float(live_price) if (live_price is not None) else float(price_eod)
 
-            # 5D change uses the ref point N trading days before the last available close
-            c_5ago = close_n_trading_days_ago(hist, p_dt_local_eod, 5, use_price_return, tz)
+            # 5D change uses the ref point N sessions before the pos
+            c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
             chg_5d = None
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price - c_5ago) / c_5ago * 100.0
 
-            # Decide baseline policy
-            policy = "euronext_preholiday" if (tz in EURONEXT_TZS and s["Region"] in ("Ireland", "Europe")) else "last_trading_day"
-
-            # YTD baseline from SAME frame using selected policy
-            base = ytd_baseline_from_hist_policy(hist, selected_date.year, use_price_return, tz, policy)
+            # YTD baseline using policy (Euronext ≤ Dec 27, others ≤ Dec 31)
+            base = ytd_baseline_from_hist_policy(hist, selected_date.year, use_price_return, is_euronext_like)
             if base is None:
                 # Fallbacks (rare)
                 base = prior_year_last_close(tkr, selected_date.year, use_price_return)
                 if base is None:
-                    jan1_local = pd.Timestamp(f"{selected_date.year}-01-01").tz_localize(tz)
-                    hist_local = _to_local_tz(hist, tz)
-                    later_idx = hist_local.index[hist_local.index >= jan1_local]
-                    if len(later_idx) > 0:
-                        base = float(hist_local.loc[later_idx[0], _col(use_price_return)])
-
-            chg_ytd = (price - base) / base * 100.0 if base else None
-
-            rows.append({
-                "Company": s["name"],
-                "Region": s["region"],
-                "Currency": s["currency"],
-                "Price": round(price, 1),
-                "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
-                "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
-            })
-        except Exception:
-            continue
-
-    if not rows:
-        st.warning("No stock data available for that date.")
-    else:
-        # build & sort the result table
-        df = (
-            pd.DataFrame(rows)
-              .sort_values(by=["Region", "Company"])
-              .reset_index(drop=True)
-        )
-
-        region_order = ["Ireland", "UK", "Europe", "US"]
-        df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
-        df = df.sort_values(["Region", "Company"])
-
-        for region in region_order:
-            g = df[df["Region"] == region]
-            if g.empty:
-                continue
-            currs = g["Currency"].unique().tolist()
-            curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
-            header = f"{region} ({curr_label})" if curr_label else region
-            st.subheader(header)
-            st.dataframe(g.drop(columns=["Region", "Currency"]), use_container_width=True)
-
-        # CSV export
-        REGION_LABELS = {
-            "Ireland": f"Ireland ({currency_symbol('EUR')})",
-            "UK":      f"UK ({currency_symbol('GBp')})",
-            "Europe":  f"Europe ({currency_symbol('EUR')})",
-            "US":      f"US ({currency_symbol('USD')})",
-        }
-
-        output = io.StringIO()
-        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-
-        for region in region_order:
-            g = df[df["Region"] == region]
-            if g.empty:
-                continue
-            writer.writerow([REGION_LABELS[region], "Last price", "5D %change", "YTD % change"])
-            for _, row in g.iterrows():
-                company = (row["Company"] or "").replace(",", "")
-                price = f"{row['Price']:.1f}" if pd.notnull(row["Price"]) else ""
-                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row["5D % Change"]) else ""
-                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row["YTD % Change"]) else ""
-                writer.writerow([company, price, c5, cy])
-
-        csv_bytes = "\ufeff" + output.getvalue()
-        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
+                    # fall back to first session in current year
+                    dates = _session_dates_index(hist)
+                    mask = dates >= date(selected_date.year, 1, 1)
+                    if mask.any():
+                        first_pos = np.where(mask)[0][0]
+                        base = float(hist.i
