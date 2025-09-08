@@ -188,6 +188,156 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
 # -----------------------------
+# Yahoo chart fetch (for YTD and as a final OHLC fallback)
+# -----------------------------
+def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        if _HTTP_LIB == "requests":
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        else:
+            full = f"{url}?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(full, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                import json
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+def chart_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+    """
+    Build a DataFrame with columns ['Close','Adj Close'] from Yahoo's chart endpoint.
+    """
+    try:
+        # Use period1/period2 to bound tightly; add padding to be safe
+        p1 = int((start_dt - timedelta(days=10)).timestamp())
+        p2 = int((end_dt + timedelta(days=10)).timestamp())
+    except Exception:
+        start_dt = pd.to_datetime(start_dt)
+        end_dt = pd.to_datetime(end_dt)
+        p1 = int((start_dt - timedelta(days=10)).timestamp())
+        p2 = int((end_dt + timedelta(days=10)).timestamp())
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "period1": p1,
+        "period2": p2,
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+    data = _http_get_json(url, params)
+    if not data:
+        return pd.DataFrame()
+
+    try:
+        result = data["chart"]["result"][0]
+        tzname = result.get("meta", {}).get("exchangeTimezoneName", "UTC")
+        tz = ZoneInfo(tzname) if ZoneInfo else None
+
+        stamps = result.get("timestamp", []) or []
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = quote.get("close", []) or []
+        adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
+
+        # Make aligned lists
+        n = min(len(stamps), len(closes))
+        dates = [ (datetime.fromtimestamp(stamps[i], tz) if tz else datetime.utcfromtimestamp(stamps[i])) for i in range(n) ]
+        close_vals = [ float(closes[i]) if closes[i] is not None else np.nan for i in range(n) ]
+        adj_vals = [ float(adjc[i]) if i < len(adjc) and adjc[i] is not None else np.nan for i in range(n) ]
+
+        df = pd.DataFrame({"Close": close_vals, "Adj Close": adj_vals}, index=pd.to_datetime(dates))
+        df = df[~df.index.duplicated(keep="last")]
+        # Trim to window
+        df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
+        return df.dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
+def yahoo_ytd_via_chart(
+    symbol: str,
+    year: int,
+    on_date: date,
+    use_live_when_today: bool = True,
+    series: str = "close",                 # "close" or "adjclose"
+    anchor_policy: str = "standard"        # "standard" => last < Jan 1; "preholiday" => last <= Dec 27
+) -> Optional[float]:
+    """
+    Compute YTD % using Yahoo's own chart data (daily series).
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
+    data = _http_get_json(url, params)
+    if not data:
+        return None
+    try:
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        tzname = meta.get("exchangeTimezoneName", "UTC")
+        tz = ZoneInfo(tzname) if ZoneInfo else None
+
+        stamps = result.get("timestamp", []) or []
+        q = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = q.get("close", []) or []
+        adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
+
+        vec = adjc if (series == "adjclose" and len(adjc) == len(stamps)) else closes
+        if not stamps or not vec:
+            return None
+
+        dcs = []
+        for t, v in zip(stamps, vec):
+            if v is None:
+                continue
+            dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
+            d = dt.date()
+            dcs.append((d, float(v)))
+        if not dcs:
+            return None
+
+        # Baseline
+        if anchor_policy == "preholiday":
+            cutoff = date(year - 1, 12, 27)
+            prev = [val for d, val in dcs if d <= cutoff]
+            if not prev:
+                return None
+            base = prev[-1]
+        else:
+            jan1 = date(year, 1, 1)
+            prev = [val for d, val in dcs if d < jan1]
+            if not prev:
+                in_year = [val for d, val in dcs if d >= jan1]
+                if not in_year:
+                    return None
+                base = in_year[0]
+            else:
+                base = prev[-1]
+
+        # Value for on_date (latest <= on_date)
+        last_vals = [val for d, val in dcs if d <= on_date]
+        if not last_vals:
+            return None
+        last_val = last_vals[-1]
+
+        # Optional: live for today if using CLOSE (price return)
+        if (series == "close") and use_live_when_today and (on_date == date.today()):
+            try:
+                fi = yf.Ticker(symbol).fast_info
+                live = fi.get("last_price") or fi.get("regular_market_price")
+                if live is not None:
+                    last_val = float(live)
+            except Exception:
+                pass
+
+        if base == 0:
+            return None
+        return (last_val - base) / base * 100.0
+    except Exception:
+        return None
+
+# -----------------------------
 # Batch + resilient fetch
 # -----------------------------
 def _split_multi(data: pd.DataFrame, tickers: List[str]) -> Dict[str, pd.DataFrame]:
@@ -237,6 +387,7 @@ def _split_multi(data: pd.DataFrame, tickers: List[str]) -> Dict[str, pd.DataFra
 def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
     """
     Try to download all tickers in one call; if some missing, fill them via per-ticker fallbacks.
+    If still empty, fill from Yahoo chart feed.
     """
     start_dt = pd.to_datetime(start)
     end_dt   = pd.to_datetime(end)
@@ -251,7 +402,7 @@ def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
             end=end_dt,
             progress=False,
             auto_adjust=False,
-            group_by="column",   # <-- key fix (was 'ticker')
+            group_by="column",   # IMPORTANT
             threads=True,
         )
         per.update(_split_multi(batch, tickers))
@@ -262,7 +413,6 @@ def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
     for t in tickers:
         if t in per and not per[t].empty:
             continue
-        # try per-ticker start/end
         try:
             h = yf.Ticker(t).history(start=start_dt, end=end_dt, interval="1d", actions=False, auto_adjust=False)
             if h is not None and not h.empty:
@@ -270,15 +420,20 @@ def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
                 continue
         except Exception:
             pass
-        # try broader period and trim
         try:
             h = yf.Ticker(t).history(period="2y", interval="1d", actions=False, auto_adjust=False)
             if h is not None and not h.empty:
                 idx = pd.to_datetime(h.index)
                 mask = (idx >= start_dt) & (idx <= end_dt)
                 per[t] = h.loc[mask] if mask.any() else h
+                continue
         except Exception:
             pass
+
+        # 3) FINAL FALLBACK: chart feed -> DataFrame with Close/Adj Close
+        chart_df = chart_series_df(t, start_dt, end_dt)
+        if not chart_df.empty:
+            per[t] = chart_df
 
     return per
 
@@ -288,109 +443,6 @@ EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
 def _is_eu_like(ticker: str, region: str) -> bool:
     t = ticker.upper()
     return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for suf in EU_SUFFIXES)
-
-# -----------------------------
-# OPTION A: Yahoo chart endpoint for exact YTD
-# -----------------------------
-def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        if _HTTP_LIB == "requests":
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        else:
-            full = f"{url}?{urllib.parse.urlencode(params)}"
-            req = urllib.request.Request(full, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                import json
-                return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-
-def yahoo_ytd_via_chart(
-    symbol: str,
-    year: int,
-    on_date: date,
-    use_live_when_today: bool = True,
-    series: str = "close",                 # "close" or "adjclose"
-    anchor_policy: str = "standard"        # "standard" => last < Jan 1; "preholiday" => last <= Dec 27
-) -> Optional[float]:
-    """
-    Compute YTD % using Yahoo's own chart data (daily series).
-    Baseline:
-      - standard: last value strictly before Jan 1 of `year`
-      - preholiday: last value on/ before Dec 27 of prior year
-    Numerator: last value on/ before `on_date` (or live price if today & series=='close' & enabled)
-    """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
-    data = _http_get_json(url, params)
-    if not data:
-        return None
-    try:
-        result = data["chart"]["result"][0]
-        meta = result.get("meta", {})
-        tzname = meta.get("exchangeTimezoneName", "UTC")
-        tz = ZoneInfo(tzname) if ZoneInfo else None
-
-        stamps = result.get("timestamp", []) or []
-        q = result.get("indicators", {}).get("quote", [{}])[0]
-        closes = q.get("close", []) or []
-        adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
-
-        vec = adjc if (series == "adjclose" and len(adjc) == len(stamps)) else closes
-        if not stamps or not vec:
-            return None
-
-        dcs = []
-        for t, v in zip(stamps, vec):
-            if v is None:
-                continue
-            dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
-            dcs.append((dt.date(), float(v)))
-        if not dcs:
-            return None
-
-        # Baseline
-        if anchor_policy == "preholiday":
-            cutoff = date(year - 1, 12, 27)
-            prev = [val for d, val in dcs if d <= cutoff]
-            if not prev:
-                return None
-            base = prev[-1]
-        else:
-            jan1 = date(year, 1, 1)
-            prev = [val for d, val in dcs if d < jan1]
-            if not prev:
-                in_year = [val for d, val in dcs if d >= jan1]
-                if not in_year:
-                    return None
-                base = in_year[0]
-            else:
-                base = prev[-1]
-
-        # Value for on_date (latest <= on_date)
-        last_vals = [val for d, val in dcs if d <= on_date]
-        if not last_vals:
-            return None
-        last_val = last_vals[-1]
-
-        # Optional: live for today if using CLOSE (price return)
-        if (series == "close") and use_live_when_today and (on_date == date.today()):
-            try:
-                fi = yf.Ticker(symbol).fast_info
-                live = fi.get("last_price") or fi.get("regular_market_price")
-                if live is not None:
-                    last_val = float(live)
-            except Exception:
-                pass
-
-        if base == 0:
-            return None
-        return (last_val - base) / base * 100.0
-    except Exception:
-        return None
 
 # -----------------------------
 # Streamlit UI
@@ -469,7 +521,7 @@ if run:
     today_date = date.today()
 
     tickers = [s["ticker"] for s in selected_stocks]
-    # Pull enough history once for all tickers (batch), then fill stragglers
+    # Pull enough history once for all tickers (batch), then fill stragglers (includes chart fallback)
     hist_map = fetch_hist_batch(
         tickers,
         start=f"{selected_date.year-1}-12-15",
