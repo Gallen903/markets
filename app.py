@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, date
 import sqlite3
 import io
 import csv
-from typing import Optional
+from typing import Optional, Dict, List
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
 try:
@@ -187,42 +187,78 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
         return None
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
-# --- Resilient fetch helper (triple fallback) ---
-def _trim_to_window(hist: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    if hist is None or hist.empty:
-        return pd.DataFrame()
-    idx = pd.to_datetime(hist.index)
-    mask = (idx >= start_dt) & (idx <= end_dt)
-    return hist.loc[mask] if mask.any() else hist
+# -----------------------------
+# Batch + resilient fetch
+# -----------------------------
+def _split_multi(data: pd.DataFrame, tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    """
+    Split yf.download's multi-ticker frame into per-ticker frames with standard OHLCV columns.
+    Works with both wide (single ticker) and MultiIndex columns.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    if data is None or data.empty:
+        return out
+    cols = data.columns
+    if isinstance(cols, pd.MultiIndex):
+        # Expected shape: top level = field, second level = ticker
+        fields = ["Open","High","Low","Close","Adj Close","Volume"]
+        for t in tickers:
+            sub = pd.concat({f: data[(f, t)] for f in fields if (f, t) in data.columns}, axis=1)
+            sub.columns = fields[:sub.shape[1]]
+            out[t] = sub.dropna(how="all")
+    else:
+        # Single ticker; we don't know which one, so map to the only ticker if there is exactly one
+        if len(tickers) == 1:
+            out[tickers[0]] = data.dropna(how="all")
+    return out
 
-def fetch_hist(tkr: str, start, end):
+def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
+    """
+    Try to download all tickers in one call; if some missing, fill them via per-ticker fallbacks.
+    """
     start_dt = pd.to_datetime(start)
     end_dt   = pd.to_datetime(end)
-    # 1) download
-    hist = yf.download(
-        tkr,
-        start=start_dt,
-        end=end_dt,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-    )
-    if hist is not None and not hist.empty:
-        return hist
-    # 2) history with start/end
+
+    per: Dict[str, pd.DataFrame] = {t: pd.DataFrame() for t in tickers}
+
+    # 1) Batch download
     try:
-        hist = yf.Ticker(tkr).history(start=start_dt, end=end_dt, interval="1d", actions=False, auto_adjust=False)
-        if hist is not None and not hist.empty:
-            return hist
+        batch = yf.download(
+            tickers,
+            start=start_dt,
+            end=end_dt,
+            progress=False,
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+        )
+        per.update(_split_multi(batch, tickers))
     except Exception:
         pass
-    # 3) broader period, then trim locally
-    try:
-        hist = yf.Ticker(tkr).history(period="2y", interval="1d", actions=False, auto_adjust=False)
-        hist = _trim_to_window(hist, start_dt, end_dt)
-    except Exception:
-        hist = pd.DataFrame()
-    return hist if hist is not None else pd.DataFrame()
+
+    # 2) Fill any empties with per-ticker fallbacks (history start/end, then period="2y")
+    for t in tickers:
+        if t in per and not per[t].empty:
+            continue
+        # try per-ticker start/end
+        try:
+            h = yf.Ticker(t).history(start=start_dt, end=end_dt, interval="1d", actions=False, auto_adjust=False)
+            if h is not None and not h.empty:
+                per[t] = h
+                continue
+        except Exception:
+            pass
+        # try broader period and trim
+        try:
+            h = yf.Ticker(t).history(period="2y", interval="1d", actions=False, auto_adjust=False)
+            if h is not None and not h.empty:
+                idx = pd.to_datetime(h.index)
+                mask = (idx >= start_dt) & (idx <= end_dt)
+                per[t] = h.loc[mask] if mask.any() else h
+        except Exception:
+            pass
+
+    return per
 
 # --- Venue helpers for Yahoo parity (EU pre-holiday + adjusted series) ---
 EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
@@ -381,6 +417,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                 st.warning("Please provide at least Ticker and Company name.")
     with c2:
         st.markdown("**Remove stocks**")
+        rem_choices = [f"{r['name']} ({r['ticker']})"] + []
         rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
         rem_sel = st.multiselect("Select to remove", rem_choices, [])
         if st.button("Remove selected"):
@@ -407,22 +444,25 @@ if run:
     target_date = target_dt.date()
     today_date = date.today()
 
+    tickers = [s["ticker"] for s in selected_stocks]
+    # Pull enough history once for all tickers (batch), then fill stragglers
+    hist_map = fetch_hist_batch(
+        tickers,
+        start=f"{selected_date.year-1}-12-15",
+        end=selected_date + timedelta(days=10),   # slightly wider to be safe
+    )
+
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Pull enough history for 5D calculation and display; resilient fetch
-            hist = fetch_hist(
-                tkr,
-                start=f"{selected_date.year-1}-12-15",
-                end=selected_date + timedelta(days=7),
-            )
-            if hist.empty:
+            hist = hist_map.get(tkr, pd.DataFrame())
+            if hist is None or hist.empty:
                 continue
 
             # Last session on/before selected date (grace up to +3 days, with hard fallback)
             price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return, grace_days=3)
             if pos is None:
-                continue  # (shouldn't happen with hard fallback, but keep guard)
+                continue
 
             # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D numerators
             use_live = use_price_return and (target_date == today_date)
