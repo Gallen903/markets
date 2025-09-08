@@ -148,8 +148,9 @@ def _to_local_tz(df: pd.DataFrame, tz: str) -> pd.DataFrame:
     """Ensure index is tz-aware and converted to the exchange's local tz."""
     if df.empty:
         return df
-    # Daily data from yfinance is often tz-naive; assume UTC then convert.
-    if df.index.tz is None:
+    idx = df.index
+    # yfinance daily data may be tz-naive; assume UTC if naive, then convert
+    if getattr(idx, "tz", None) is None:
         df = df.tz_localize("UTC")
     return df.tz_convert(tz)
 
@@ -157,6 +158,7 @@ def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timest
     if tkr_hist.empty:
         return None, None
     hist_local = _to_local_tz(tkr_hist, tz)
+    # interpret the chosen date in local time (end-of-day)
     target_local_eod = pd.Timestamp(target_dt).tz_localize(tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
     idx = hist_local.index[hist_local.index <= target_local_eod]
     if len(idx) == 0:
@@ -319,14 +321,12 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        
-        # build & sort the result table
-df = (
-    pd.DataFrame(rows)
-      .sort_values(by=["Region", "Company"])
-      .reset_index(drop=True)
-)
-
+        # build & sort the result table (fixed reset_index)
+        df = (
+            pd.DataFrame(rows)
+              .sort_values(by=["Region", "Company"])
+              .reset_index(drop=True)
+        )
 
         region_order = ["Ireland", "UK", "Europe", "US"]
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
