@@ -193,23 +193,45 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
 def _split_multi(data: pd.DataFrame, tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """
     Split yf.download's multi-ticker frame into per-ticker frames with standard OHLCV columns.
-    Works with both wide (single ticker) and MultiIndex columns.
+    Supports both orientations:
+      - (field, ticker)  [group_by='column']
+      - (ticker, field)  [group_by='ticker']
     """
     out: Dict[str, pd.DataFrame] = {}
     if data is None or data.empty:
         return out
     cols = data.columns
+
+    fields = ["Open","High","Low","Close","Adj Close","Volume"]
+
     if isinstance(cols, pd.MultiIndex):
-        # Expected shape: top level = field, second level = ticker
-        fields = ["Open","High","Low","Close","Adj Close","Volume"]
-        for t in tickers:
-            sub = pd.concat({f: data[(f, t)] for f in fields if (f, t) in data.columns}, axis=1)
-            sub.columns = fields[:sub.shape[1]]
-            out[t] = sub.dropna(how="all")
+        lvl0_vals = list(map(str, cols.get_level_values(0)))
+        lvl1_vals = list(map(str, cols.get_level_values(1)))
+
+        if set(fields).issubset(set(lvl0_vals)):
+            # Orientation: (field, ticker)
+            for t in tickers:
+                parts = []
+                for f in fields:
+                    key = (f, t)
+                    if key in data.columns:
+                        parts.append(data[key].rename(f))
+                if parts:
+                    sub = pd.concat(parts, axis=1)
+                    out[t] = sub.dropna(how="all")
+        else:
+            # Orientation: (ticker, field)
+            for t in tickers:
+                if t in cols.get_level_values(0):
+                    sub = data[t]
+                    keep = [f for f in fields if f in sub.columns]
+                    if keep:
+                        out[t] = sub[keep].dropna(how="all")
     else:
-        # Single ticker; we don't know which one, so map to the only ticker if there is exactly one
+        # Single-ticker dataframe
         if len(tickers) == 1:
             out[tickers[0]] = data.dropna(how="all")
+
     return out
 
 def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
@@ -221,7 +243,7 @@ def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
 
     per: Dict[str, pd.DataFrame] = {t: pd.DataFrame() for t in tickers}
 
-    # 1) Batch download
+    # 1) Batch download (use group_by='column' so columns are (field, ticker))
     try:
         batch = yf.download(
             tickers,
@@ -229,7 +251,7 @@ def fetch_hist_batch(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
             end=end_dt,
             progress=False,
             auto_adjust=False,
-            group_by="ticker",
+            group_by="column",   # <-- key fix (was 'ticker')
             threads=True,
         )
         per.update(_split_multi(batch, tickers))
@@ -417,7 +439,10 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                 st.warning("Please provide at least Ticker and Company name.")
     with c2:
         st.markdown("**Remove stocks**")
-        rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
+        rem_choices = [
+            f"{r['name']} ({r['ticker']})"
+            for _, r in stocks_df.sort_values("name").iterrows()
+        ]
         rem_sel = st.multiselect("Select to remove", rem_choices, [])
         if st.button("Remove selected"):
             tickers = [s[s.rfind("(")+1:-1] for s in rem_sel]
