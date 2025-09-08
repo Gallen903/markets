@@ -97,7 +97,7 @@ def init_db_with_defaults():
         ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
         ("UPR.IR","Uniphar plc","Ireland","EUR"),
         ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
-        ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
+        ("PTSB.IR","PTSB Group Holdings plc","Ireland","EUR"),
         ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
         ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
         ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
@@ -180,6 +180,13 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
         return None
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
+# --- Venue helpers for Yahoo parity (EU pre-holiday + adjusted series) ---
+EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
+
+def _is_eu_like(ticker: str, region: str) -> bool:
+    t = ticker.upper()
+    return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for suf in EU_SUFFIXES)
+
 # -----------------------------
 # OPTION A: Yahoo chart endpoint for exact YTD
 # -----------------------------
@@ -199,14 +206,23 @@ def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[di
     except Exception:
         return None
 
-def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
+def yahoo_ytd_via_chart(
+    symbol: str,
+    year: int,
+    on_date: date,
+    use_live_when_today: bool = True,
+    series: str = "close",                 # "close" or "adjclose"
+    anchor_policy: str = "standard"        # "standard" => last < Jan 1; "preholiday" => last <= Dec 27
+) -> Optional[float]:
     """
-    Compute YTD % using Yahoo's own chart data (daily 'close' series).
-    Baseline: last close BEFORE Jan 1 of `year` (local to exchange).
-    Numerator: last close ON/BEFORE `on_date` (or live price if today & requested).
+    Compute YTD % using Yahoo's own chart data (daily series).
+    Baseline:
+      - standard: last value strictly before Jan 1 of `year`
+      - preholiday: last value on/ before Dec 27 of prior year
+    Numerator: last value on/ before `on_date` (or live price if today & series=='close' & enabled)
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    # Use 2y to ensure we capture prior-year EOY sessions for baseline
+    # 2y to ensure we include prior-year EOY sessions
     params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
     data = _http_get_json(url, params)
     if not data:
@@ -218,50 +234,62 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
         tz = ZoneInfo(tzname) if ZoneInfo else None
 
         stamps = result.get("timestamp", []) or []
-        closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
-        if not stamps or not closes:
+        q = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = q.get("close", []) or []
+        adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
+
+        # Select series
+        vec = adjc if (series == "adjclose" and len(adjc) == len(stamps)) else closes
+        if not stamps or not vec:
             return None
 
         dcs = []
-        for t, c in zip(stamps, closes):
-            if c is None:
+        for t, v in zip(stamps, vec):
+            if v is None:
                 continue
             dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
-            dcs.append((dt.date(), float(c)))
+            dcs.append((dt.date(), float(v)))
         if not dcs:
             return None
 
-        # Baseline: last date strictly before Jan 1 of `year`
-        jan1 = date(year, 1, 1)
-        prior = [c for d, c in dcs if d < jan1]
-        if not prior:
-            # fallback: baseline = first available in the year
-            in_year = [c for d, c in dcs if d >= jan1]
-            if not in_year:
+        # Baseline
+        if anchor_policy == "preholiday":
+            cutoff = date(year - 1, 12, 27)
+            prev = [val for d, val in dcs if d <= cutoff]
+            if not prev:
                 return None
-            base = in_year[0]
+            base = prev[-1]
         else:
-            base = prior[-1]
+            jan1 = date(year, 1, 1)
+            prev = [val for d, val in dcs if d < jan1]
+            if not prev:
+                # fallback: first available in-year
+                in_year = [val for d, val in dcs if d >= jan1]
+                if not in_year:
+                    return None
+                base = in_year[0]
+            else:
+                base = prev[-1]
 
         # Value for on_date (latest <= on_date)
-        last_vals = [c for d, c in dcs if d <= on_date]
+        last_vals = [val for d, val in dcs if d <= on_date]
         if not last_vals:
             return None
-        last_close = last_vals[-1]
+        last_val = last_vals[-1]
 
-        # Optional: use live when on_date == today (mirrors Yahoo summary)
-        if use_live_when_today and on_date == date.today():
+        # Optional: live for today if using CLOSE (price return)
+        if (series == "close") and use_live_when_today and (on_date == date.today()):
             try:
                 fi = yf.Ticker(symbol).fast_info
                 live = fi.get("last_price") or fi.get("regular_market_price")
                 if live is not None:
-                    last_close = float(live)
+                    last_val = float(live)
             except Exception:
                 pass
 
         if base == 0:
             return None
-        return (last_close - base) / base * 100.0
+        return (last_val - base) / base * 100.0
     except Exception:
         return None
 
@@ -281,7 +309,8 @@ use_price_return = st.toggle(
 exact_yahoo_mode = st.toggle(
     "Exact Yahoo YTD (chart feed)",
     value=True,
-    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
+    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar. "
+         "For Irish/EU tickers uses adjclose + pre-holiday baseline."
 )
 
 init_db_with_defaults()
@@ -356,7 +385,7 @@ if run:
             if pos is None:
                 continue
 
-            # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D/YTD numerators
+            # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D numerators
             use_live = use_price_return and (target_date == today_date)
             live_price = None
             if use_live:
@@ -377,9 +406,17 @@ if run:
 
             # YTD %
             if exact_yahoo_mode:
-                chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
+                eu_like = _is_eu_like(tkr, s["Region"])
+                series  = "adjclose" if eu_like else "close"
+                policy  = "preholiday" if eu_like else "standard"
+                chg_ytd = yahoo_ytd_via_chart(
+                    tkr, selected_date.year, target_date,
+                    use_live_when_today=use_price_return,
+                    series=series,
+                    anchor_policy=policy
+                )
             else:
-                # Fallback to internal computation (using prior-year last session as baseline)
+                # Fallback to internal computation (prior-year last session baseline)
                 dates = _session_dates_index(hist)
                 mask_prev = dates <= date(selected_date.year - 1, 12, 31)
                 base = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
