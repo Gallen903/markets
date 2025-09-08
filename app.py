@@ -1,150 +1,307 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import yfinance as yf
-from yahooquery import Ticker
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import sqlite3
+import io
 import csv
-import os
+from pathlib import Path
 
-DB_FILE = "stocks.db"
+DB_PATH = "stocks.db"
 
-# --- Database setup ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS stocks
-                 (ticker TEXT PRIMARY KEY, name TEXT, region TEXT, currency TEXT)''')
+# -----------------------------
+# SQLite helpers
+# -----------------------------
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db_with_defaults():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            ticker TEXT PRIMARY KEY,
+            name   TEXT NOT NULL,
+            region TEXT NOT NULL,   -- Ireland | UK | Europe | US
+            currency TEXT NOT NULL  -- EUR | GBp | USD
+        )
+    """)
+    # Only seed if empty
+    cur.execute("SELECT COUNT(*) FROM stocks")
+    if cur.fetchone()[0] == 0:
+        defaults = [
+            # --- US ---
+            ("STT","State Street Corporation","US","USD"),
+            ("PFE","Pfizer Inc.","US","USD"),
+            ("SBUX","Starbucks Corporation","US","USD"),
+            ("PEP","PepsiCo, Inc.","US","USD"),
+            ("ORCL","Oracle Corporation","US","USD"),
+            ("NVS","Novartis AG","US","USD"),
+            ("META","Meta Platforms, Inc.","US","USD"),
+            ("MSFT","Microsoft Corporation","US","USD"),
+            ("MRK","Merck & Co., Inc.","US","USD"),
+            ("JNJ","Johnson & Johnson","US","USD"),
+            ("INTC","Intel Corporation","US","USD"),
+            ("ICON","Icon Energy Corp.","US","USD"),
+            ("HPQ","HP Inc.","US","USD"),
+            ("GE","GE Aerospace","US","USD"),
+            ("LLY","Eli Lilly and Company","US","USD"),
+            ("EBAY","eBay Inc.","US","USD"),
+            ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
+            ("BSX","Boston Scientific Corporation","US","USD"),
+            ("AAPL","Apple Inc.","US","USD"),
+            ("AMGN","Amgen Inc.","US","USD"),
+            ("ADI","Analog Devices, Inc.","US","USD"),
+            ("ABBV","AbbVie Inc.","US","USD"),
+            ("GOOG","Alphabet Inc.","US","USD"),
+            ("ABT","Abbott Laboratories","US","USD"),
+            ("CRH","CRH plc","US","USD"),
+            ("SW","Smurfit Westrock Plc","US","USD"),
+            ("DEO","Diageo","US","USD"),
+            ("AER","AerCap Holdings","US","USD"),
+            ("FLUT","Flutter Entertainment plc","US","USD"),
+
+            # --- Europe (non-UK, non-Ireland) ---
+            ("HEIA.AS","Heineken N.V.","Europe","EUR"),
+            ("BSN.F","Danone S.A.","Europe","EUR"),
+            ("BKT.MC","Bankinter","Europe","EUR"),
+
+            # --- UK ---
+            ("VOD.L","Vodafone Group","UK","GBp"),
+            ("DCC.L","DCC plc","UK","GBp"),
+            ("GNCL.XC","Greencore Group plc","UK","GBp"),
+            ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+            ("HVO.L","hVIVO plc","UK","GBp"),
+            ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
+            ("TSCOL.XC","Tesco plc","UK","GBp"),
+            ("BRBY.L","Burberry","UK","GBp"),
+            ("SSPG.L","SSP Group","UK","GBp"),
+            ("ABF.L","Associated British Foods","UK","GBp"),
+            ("GWMO.L","Great Western Mining Corp","UK","GBp"),
+
+            # --- Ireland ---
+            ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
+            ("UPR.IR","Uniphar plc","Ireland","EUR"),
+            ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
+            ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
+            ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
+            ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
+            ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
+            ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
+            ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
+            ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
+            ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
+            ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
+            ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
+            ("GL9.IR","Glanbia plc","Ireland","EUR"),
+            ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
+            ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
+            ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
+            ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
+            ("A5G.IR","AIB Group plc","Ireland","EUR"),
+            ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
+            ("YZA.IR","Arytza","Ireland","EUR"),
+        ]
+        cur.executemany("INSERT INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)", defaults)
     conn.commit()
     conn.close()
 
-def load_stocks():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT ticker, name, region, currency FROM stocks")
-    rows = c.fetchall()
+def db_all_stocks():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", conn)
     conn.close()
-    return [{"ticker": r[0], "name": r[1], "region": r[2], "currency": r[3]} for r in rows]
+    return df
 
-def save_stock(ticker, name, region, currency):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO stocks VALUES (?, ?, ?, ?)", (ticker, name, region, currency))
+def db_add_stock(ticker, name, region, currency):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
+                (ticker.strip(), name.strip(), region, currency))
     conn.commit()
     conn.close()
 
-def remove_stock(ticker):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM stocks WHERE ticker=?", (ticker,))
+def db_remove_stocks(tickers):
+    if not tickers:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.executemany("DELETE FROM stocks WHERE ticker = ?", [(t,) for t in tickers])
     conn.commit()
     conn.close()
 
-# --- Finance data fetching ---
-def fetch_stock_data(ticker, name, region, currency, start_date, end_date):
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(start=start_date, end=end_date)
+# -----------------------------
+# Finance helpers
+# -----------------------------
+def last_trading_close_on_or_before(tkr_hist: pd.DataFrame, target_dt: pd.Timestamp):
+    if tkr_hist.empty:
+        return None, None
+    idx = tkr_hist.index[tkr_hist.index <= target_dt]
+    if len(idx) == 0:
+        return None, None
+    dt = idx[-1]
+    return float(tkr_hist.loc[dt, "Adj Close"]), dt  # use adjusted close
 
-        if hist.empty:
-            return None
-
-        last_price = hist["Close"].iloc[-1]
-
-        # --- 5D change (adjusted close) ---
-        five_days_ago = hist.index[-1] - timedelta(days=7)
-        hist_5d = hist[hist.index >= five_days_ago]
-        if len(hist_5d) > 1:
-            five_day_change = ((hist_5d["Close"].iloc[-1] / hist_5d["Close"].iloc[0]) - 1) * 100
-        else:
-            five_day_change = None
-
-        # --- YTD change (via yahooquery, matches Yahoo site exactly) ---
-        yq = Ticker(ticker)
-        summary = yq.summary_detail
-        try:
-            ytd_return = summary[ticker].get("ytdReturn", None)
-            if ytd_return is not None:
-                ytd_change = ytd_return * 100
-            else:
-                ytd_change = None
-        except Exception:
-            ytd_change = None
-
-        return {
-            "Region": region,
-            "Name": name,
-            "Last price": f"{last_price:.1f}",
-            "5D %change": f"{five_day_change:.1f}" if five_day_change is not None else "N/A",
-            "YTD % change": f"{ytd_change:.1f}" if ytd_change is not None else "N/A",
-            "Currency": currency
-        }
-    except Exception:
+def close_n_trading_days_ago(tkr_hist: pd.DataFrame, ref_dt: pd.Timestamp, n: int):
+    if tkr_hist.empty:
         return None
+    idx = tkr_hist.index[tkr_hist.index <= ref_dt]
+    if len(idx) <= n:
+        return None
+    past_dt = idx[-(n+1)]
+    return float(tkr_hist.loc[past_dt, "Adj Close"])  # adjusted close
 
-# --- CSV export ---
-def export_to_csv(data, filename="stock_data.csv"):
-    regions = ["Ireland", "UK", "Europe", "US"]
-    with open(filename, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file, delimiter="\t")
+def prior_year_last_close(ticker: str, target_year: int):
+    start = f"{target_year-1}-12-01"
+    end   = f"{target_year}-01-10"
+    hist = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+    if hist.empty:
+        return None
+    cutoff = pd.Timestamp(f"{target_year}-01-01")
+    idx = hist.index[hist.index < cutoff]
+    if len(idx) == 0:
+        return float(hist.iloc[0]["Adj Close"])
+    return float(hist.loc[idx[-1], "Adj Close"])
 
-        for region in regions:
-            region_data = [row for row in data if row["Region"] == region]
-            if region_data:
-                writer.writerow([f"{region} ({region_data[0]['Currency']})", "Last price", "5D %change", "YTD % change"])
-                for row in region_data:
-                    writer.writerow([
-                        row["Name"],
-                        row["Last price"],
-                        row["5D %change"],
-                        row["YTD % change"]
-                    ])
+def currency_symbol(cur: str) -> str:
+    return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
 
-# --- Streamlit UI ---
-def main():
-    st.title("Stock Performance Dashboard")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Stock Dashboard", layout="wide")
+st.title("📊 Stock Dashboard")
+st.caption("Last price, 5-day % change, YTD % change (YTD uses prior-year last trading close).")
 
-    init_db()
-    stocks = load_stocks()
+init_db_with_defaults()
+stocks_df = db_all_stocks()
 
-    start_date = st.sidebar.date_input("Start Date", datetime(datetime.today().year, 1, 1))
-    end_date = st.sidebar.date_input("End Date", datetime.today())
+colA, colB = st.columns([1,1])
+with colA:
+    selected_date = st.date_input("Select date", value=date.today())
+with colB:
+    st.write(" ")
+    run = st.button("Run")
 
-    # Add stock
-    st.sidebar.header("Add Stock")
-    ticker = st.sidebar.text_input("Ticker")
-    name = st.sidebar.text_input("Name")
-    region = st.sidebar.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
-    currency = st.sidebar.selectbox("Currency", ["€", "£", "$"])
-    if st.sidebar.button("Add/Update Stock"):
-        if ticker and name:
-            save_stock(ticker, name, region, currency)
-            st.sidebar.success(f"Added/Updated {name} ({ticker})")
+# Editor: add/remove stocks
+with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
+    c1, c2 = st.columns([1.2, 1])
+    with c1:
+        st.markdown("**Add a stock**")
+        a_ticker = st.text_input("Ticker (e.g., AAPL, HEIA.AS)")
+        a_name   = st.text_input("Company name")
+        a_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
+        a_curr   = st.selectbox("Currency", ["EUR", "GBp", "USD"])
+        if st.button("Add / Update"):
+            if a_ticker and a_name:
+                db_add_stock(a_ticker, a_name, a_region, a_curr)
+                st.success(f"Saved {a_name} ({a_ticker})")
+            else:
+                st.warning("Please provide at least Ticker and Company name.")
+    with c2:
+        st.markdown("**Remove stocks**")
+        rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
+        rem_sel = st.multiselect("Select to remove", rem_choices, [])
+        if st.button("Remove selected"):
+            tickers = [s[s.rfind("(")+1:-1] for s in rem_sel]
+            db_remove_stocks(tickers)
+            st.success(f"Removed {len(tickers)} stock(s)")
 
-    # Remove stock
-    st.sidebar.header("Remove Stock")
-    all_tickers = [s["ticker"] for s in stocks]
-    ticker_to_remove = st.sidebar.selectbox("Select ticker to remove", [""] + all_tickers)
-    if st.sidebar.button("Remove Stock") and ticker_to_remove:
-        remove_stock(ticker_to_remove)
-        st.sidebar.success(f"Removed {ticker_to_remove}")
+# Stock selection for this run
+stocks_df = db_all_stocks()
+stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
+sel_labels = st.multiselect(
+    "Stocks to include in this run:",
+    list(stock_options.keys()),
+    default=list(stock_options.keys())
+)
+selected_stocks = [stock_options[label] for label in sel_labels]
 
-    # Fetch data
-    if st.button("Fetch Data"):
-        data = []
-        for stock in stocks:
-            stock_data = fetch_stock_data(stock["ticker"], stock["name"], stock["region"], stock["currency"], start_date, end_date)
-            if stock_data:
-                data.append(stock_data)
+# -----------------------------
+# Run calculation
+# -----------------------------
+if run:
+    rows = []
+    target_dt = pd.to_datetime(selected_date)
 
-        if data:
-            df = pd.DataFrame(data)
-            st.dataframe(df)
+    for s in selected_stocks:
+        tkr = s["ticker"]
+        try:
+            hist = yf.download(
+                tkr,
+                start=f"{selected_date.year}-01-01",
+                end=selected_date + timedelta(days=3),  # extend by 3 days
+                progress=False,
+                auto_adjust=False,
+            )
+            if hist.empty:
+                continue
 
-            export_to_csv(data)
-            st.success("Data exported to stock_data.csv")
-        else:
-            st.warning("No data found for the selected stocks.")
+            price, p_dt = last_trading_close_on_or_before(hist, target_dt)
+            if price is None:
+                continue
 
-if __name__ == "__main__":
-    main()
+            c_5ago = close_n_trading_days_ago(hist, p_dt, 5)
+            chg_5d = None
+            if c_5ago is not None and c_5ago != 0:
+                chg_5d = (price - c_5ago) / c_5ago * 100.0
+
+            base = prior_year_last_close(tkr, selected_date.year)
+            if base is None:
+                base = float(hist.iloc[0]["Adj Close"])
+            chg_ytd = (price - base) / base * 100.0 if base else None
+
+            rows.append({
+                "Company": s["name"],
+                "Region": s["region"],
+                "Currency": s["currency"],
+                "Price": round(price, 1),
+                "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
+                "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        st.warning("No stock data available for that date.")
+    else:
+        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"]).reset_index(drop=True)
+
+        region_order = ["Ireland", "UK", "Europe", "US"]
+        df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
+        df = df.sort_values(["Region", "Company"])
+
+        for region in region_order:
+            g = df[df["Region"] == region]
+            if g.empty:
+                continue
+            currs = g["Currency"].unique().tolist()
+            curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
+            header = f"{region} ({curr_label})" if curr_label else region
+            st.subheader(header)
+            st.dataframe(g.drop(columns=["Region", "Currency"]), use_container_width=True)
+
+        # CSV export
+        REGION_LABELS = {
+            "Ireland": f"Ireland ({currency_symbol('EUR')})",
+            "UK":      f"UK ({currency_symbol('GBp')})",
+            "Europe":  f"Europe ({currency_symbol('EUR')})",
+            "US":      f"US ({currency_symbol('USD')})",
+        }
+
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
+        for region in region_order:
+            g = df[df["Region"] == region]
+            if g.empty:
+                continue
+            writer.writerow([REGION_LABELS[region], "Last price", "5D %change", "YTD % change"])
+            for _, row in g.iterrows():
+                company = (row["Company"] or "").replace(",", "")
+                price = f"{row['Price']:.1f}" if pd.notnull(row["Price"]) else ""
+                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row["5D % Change"]) else ""
+                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row["YTD % Change"]) else ""
+                writer.writerow([company, price, c5, cy])
+
+        csv_bytes = "\ufeff" + output.getvalue()
+        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
