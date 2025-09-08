@@ -319,9 +319,14 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"]).reset_index(drop_by=True if hasattr(pd.DataFrame, "reset_index") else False)
-        if "index" in df.columns:
-            df = df.drop(columns=["index"])  # compatibility for older pandas
+        
+        # build & sort the result table
+df = (
+    pd.DataFrame(rows)
+      .sort_values(by=["Region", "Company"])
+      .reset_index(drop=True)
+)
+
 
         region_order = ["Ireland", "UK", "Europe", "US"]
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
