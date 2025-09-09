@@ -40,10 +40,10 @@ def init_db_with_defaults():
             ticker TEXT PRIMARY KEY,
             name   TEXT NOT NULL,
             region TEXT NOT NULL,   -- Ireland | UK | Europe | US
-            currency TEXT NOT NULL  -- EUR | GBp | USD
+            currency TEXT NOT NULL  -- EUR | GBp | USD | DKK | CHF
         )
     """)
-    # NEW: Manual YTD baselines (one per ticker+year)
+    # Manual YTD baselines (one per ticker+year)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reference_prices (
             ticker TEXT NOT NULL,
@@ -93,6 +93,11 @@ def init_db_with_defaults():
         ("HEIA.AS","Heineken N.V.","Europe","EUR"),
         ("BSN.F","Danone S.A.","Europe","EUR"),
         ("BKT.MC","Bankinter","Europe","EUR"),
+        # Added primaries:
+        ("IBE.MC","Iberdrola S.A.","Europe","EUR"),    # Madrid (primary)
+        ("ORSTED.CO","Orsted A/S","Europe","DKK"),     # Copenhagen (primary)
+        ("ROG.SW","Roche Holding AG","Europe","CHF"),  # SIX Swiss (primary)
+        ("SAN.PA","Sanofi","Europe","EUR"),            # Paris (primary)
 
         # --- UK ---
         ("VOD.L","Vodafone Group","UK","GBp"),
@@ -160,7 +165,7 @@ def db_remove_stocks(tickers):
     conn.commit()
     conn.close()
 
-# ---- NEW: reference_prices helpers ----
+# ---- reference_prices helpers ----
 def db_set_reference(ticker: str, year: int, price: float, date_iso: Optional[str], series: Optional[str], notes: Optional[str]):
     conn = get_conn()
     cur = conn.cursor()
@@ -204,7 +209,13 @@ def db_delete_references(keys):
 # Helpers for prices/returns
 # -----------------------------
 def currency_symbol(cur: str) -> str:
-    return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
+    return {
+        "USD": "$",
+        "EUR": "€",
+        "GBp": "£",
+        "DKK": "kr",
+        "CHF": "Fr",
+    }.get(cur, "")
 
 def _col(use_price_return: bool) -> str:
     # Yahoo UI uses price return => 'Close'; total return => 'Adj Close'
@@ -235,7 +246,7 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
 # -----------------------------
-# OPTION A: Yahoo chart endpoint for exact YTD
+# Yahoo chart endpoint for exact YTD
 # -----------------------------
 def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -260,7 +271,6 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
     Numerator: last close ON/BEFORE `on_date` (or live price if today & requested).
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    # Use 2y to ensure we capture prior-year EOY sessions for baseline
     params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
     data = _http_get_json(url, params)
     if not data:
@@ -285,11 +295,9 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
         if not dcs:
             return None
 
-        # Baseline: last date strictly before Jan 1 of `year`
         jan1 = date(year, 1, 1)
         prior = [c for d, c in dcs if d < jan1]
         if not prior:
-            # fallback: baseline = first available in the year
             in_year = [c for d, c in dcs if d >= jan1]
             if not in_year:
                 return None
@@ -297,13 +305,11 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
         else:
             base = prior[-1]
 
-        # Value for on_date (latest <= on_date)
         last_vals = [c for d, c in dcs if d <= on_date]
         if not last_vals:
             return None
         last_close = last_vals[-1]
 
-        # Optional: use live when on_date == today (mirrors Yahoo summary)
         if use_live_when_today and on_date == date.today():
             try:
                 fi = yf.Ticker(symbol).fast_info
@@ -337,12 +343,20 @@ exact_yahoo_mode = st.toggle(
     value=True,
     help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
 )
-# NEW: manual baseline toggle
 use_manual_baselines = st.toggle(
     "Use manual YTD baselines when available",
     value=True,
     help="If a manual baseline exists for (ticker, year), it overrides the automatic YTD baseline."
 )
+# New: rounding toggle
+round_two_dp = st.toggle(
+    "Round to 2 decimal places (off = 1 dp)",
+    value=False,
+    help="Switch between rounding numbers to 1 or 2 decimal places across Price and % columns."
+)
+DP = 2 if round_two_dp else 1
+price_fmt = f"{{:.{DP}f}}"
+pct_fmt   = f"{{:.{DP}f}}"
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -359,10 +373,10 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
         st.markdown("**Add a stock**")
-        a_ticker = st.text_input("Ticker (e.g., AAPL, HEIA.AS)")
+        a_ticker = st.text_input("Ticker (e.g., AAPL, ORSTED.CO)")
         a_name   = st.text_input("Company name")
         a_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
-        a_curr   = st.selectbox("Currency", ["EUR", "GBp", "USD"])
+        a_curr   = st.selectbox("Currency", ["EUR", "GBp", "USD", "DKK", "CHF"])
         if st.button("Add / Update"):
             if a_ticker and a_name:
                 db_add_stock(a_ticker, a_name, a_region, a_curr)
@@ -378,7 +392,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             db_remove_stocks(tickers)
             st.success(f"Removed {len(tickers)} stock(s)")
 
-# ---- NEW: Manual YTD baseline manager
+# ---- Manual YTD baseline manager
 with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
     cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
     st.caption("Each row defines the **baseline price** used for YTD % for that ticker in this year. Price should match the series you want to mirror (Yahoo typically uses Close).")
@@ -532,9 +546,9 @@ if run:
                 "Manual": "🧭" if manual_used else "",
                 "Region": s["region"],
                 "Currency": s["currency"],
-                "Price": round(price_num, 1),
-                "5D % Change": round(chg_5d, 1) if chg_5d is not None else None,
-                "YTD % Change": round(chg_ytd, 1) if chg_ytd is not None else None,
+                "Price": round(price_num, DP),
+                "5D % Change": round(chg_5d, DP) if chg_5d is not None else None,
+                "YTD % Change": round(chg_ytd, DP) if chg_ytd is not None else None,
             })
         except Exception:
             continue
@@ -566,7 +580,7 @@ if run:
             st.subheader(header)
             st.dataframe(g[display_cols], use_container_width=True)
 
-        # CSV export (unchanged format; badge not included)
+        # CSV export (unchanged headers; values formatted using chosen decimal places)
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
             "UK":      f"UK ({currency_symbol('GBp')})",
@@ -584,9 +598,9 @@ if run:
             writer.writerow([REGION_LABELS[region], "Last price", "5D %change", "YTD % change"])
             for _, row in g.iterrows():
                 company = (row["Company"] or "").replace(",", "")
-                price = f"{row['Price']:.1f}" if pd.notnull(row["Price"]) else ""
-                c5 = f"{row['5D % Change']:.1f}" if pd.notnull(row["5D % Change"]) else ""
-                cy = f"{row['YTD % Change']:.1f}" if pd.notnull(row["YTD % Change"]) else ""
+                price = (price_fmt.format(row['Price'])) if pd.notnull(row["Price"]) else ""
+                c5 = (pct_fmt.format(row['5D % Change'])) if pd.notnull(row["5D % Change"]) else ""
+                cy = (pct_fmt.format(row['YTD % Change'])) if pd.notnull(row["YTD % Change"]) else ""
                 writer.writerow([company, price, c5, cy])
 
         csv_bytes = "\ufeff" + output.getvalue()
