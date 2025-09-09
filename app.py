@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, date
 import sqlite3
 import io
 import csv
-from pathlib import Path
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
@@ -22,6 +21,14 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None  # fallback to UTC if not available
+
+# --- Exchange calendars (optional) ---
+try:
+    import exchange_calendars as xcals
+    _HAS_XCALS = True
+except Exception:
+    xcals = None
+    _HAS_XCALS = False
 
 DB_PATH = "stocks.db"
 
@@ -102,11 +109,11 @@ def init_db_with_defaults():
         # --- UK ---
         ("VOD.L","Vodafone Group","UK","GBp"),
         ("DCC.L","DCC plc","UK","GBp"),
-        ("GNCL.L","Greencore Group plc","UK","GBp"),
-        ("GFTUL.L","Grafton Group plc","UK","GBp"),
+        ("GNCL.XC","Greencore Group plc","UK","GBp"),
+        ("GFTUL.XC","Grafton Group plc","UK","GBp"),
         ("HVO.L","hVIVO plc","UK","GBp"),
         ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-        ("TSCOL.L","Tesco plc","UK","GBp"),
+        ("TSCOL.XC","Tesco plc","UK","GBp"),
         ("BRBY.L","Burberry","UK","GBp"),
         ("SSPG.L","SSP Group","UK","GBp"),
         ("ABF.L","Associated British Foods","UK","GBp"),
@@ -326,11 +333,70 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
         return None
 
 # -----------------------------
+# OFFICIAL EXCHANGE CALENDAR (Option B) helpers
+# -----------------------------
+# Map Yahoo suffix -> exchange calendar code
+CAL_BY_SUFFIX = {
+    "IR": "XDUB",  # Dublin
+    "PA": "XPAR",  # Paris
+    "AS": "XAMS",  # Amsterdam
+    "BR": "XBRU",  # Brussels
+    "LS": "XLIS",  # Lisbon
+    "L":  "XLON",  # London
+    "MC": "XMAD",  # Madrid (BME)
+    "CO": "XCSE",  # Copenhagen (Nasdaq Nordic)
+    "SW": "XSWX",  # SIX Swiss
+    "DE": "XETR",  # Xetra (Frankfurt)
+    "F":  "XFRA",  # Frankfurt floor
+    "MI": "XMIL",  # Milan
+}
+
+def _suffix(sym: str) -> str:
+    return sym.split(".")[-1].upper() if "." in sym else ""
+
+def ticker_calendar_code(ticker: str) -> Optional[str]:
+    suf = _suffix(ticker)
+    return CAL_BY_SUFFIX.get(suf)
+
+def official_prev_year_last_session(ticker: str, year: int) -> Optional[date]:
+    """Return the official last trading SESSION DATE < Jan 1 of `year` for ticker's venue."""
+    if not _HAS_XCALS:
+        return None
+    cal_code = ticker_calendar_code(ticker)
+    if not cal_code:
+        return None
+    try:
+        cal = xcals.get_calendar(cal_code)
+        sched = cal.schedule(start=f"{year-1}-12-01", end=f"{year}-01-10")
+        # sessions index is tz-aware; we want the last session strictly before Jan 1
+        idx = sched.index
+        if len(idx) == 0:
+            return None
+        prev = idx[idx.date < date(year, 1, 1)]
+        return prev[-1].date() if len(prev) else None
+    except Exception:
+        return None
+
+def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_price_return: bool) -> Optional[float]:
+    """Pick baseline from history at the requested session date (or the last available <= date)."""
+    if hist is None or hist.empty:
+        return None
+    dates = _session_dates_index(hist)
+    mask = dates <= session_date
+    if not mask.any():
+        return None
+    pos = np.where(mask)[0][-1]
+    try:
+        return float(hist.iloc[pos][_col(use_price_return)])
+    except Exception:
+        return None
+
+# -----------------------------
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, and YTD % change. YTD can be computed from Yahoo's chart feed for exact parity.")
+st.caption("Last price, 5-day % change, and YTD % change. YTD can use official exchange calendars for the baseline (Europe) or Yahoo's chart feed.")
 
 # Toggles
 use_price_return = st.toggle(
@@ -347,6 +413,11 @@ use_manual_baselines = st.toggle(
     "Use manual YTD baselines when available",
     value=True,
     help="If a manual baseline exists for (ticker, year), it overrides the automatic YTD baseline."
+)
+use_official_calendars = st.toggle(
+    "Use official exchange calendars for YTD baseline (Europe)",
+    value=True,
+    help="Computes the baseline as the last official session < Jan 1 per venue (e.g., XDUB/XPAR/XAMS/XMAD/XCSE/XSWX). Falls back if calendar unavailable."
 )
 # Rounding
 round_two_dp = st.toggle(
@@ -367,6 +438,9 @@ show_index_charts = st.checkbox(
     "Mini charts for indices (last ~10 sessions)",
     value=False
 )
+
+if use_official_calendars and not _HAS_XCALS:
+    st.warning("`exchange_calendars` not installed. Install it (e.g., add `exchange_calendars` to requirements.txt) to enable official YTD baselines. Falling back to Yahoo baseline logic.")
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -533,9 +607,11 @@ if run:
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price_num - c_5ago) / c_5ago * 100.0
 
-            # YTD %
+            # YTD %  (precedence: Manual → Official calendars → Yahoo chart → fallback)
             manual_used = False
             chg_ytd = None
+
+            # 1) Manual
             manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
             if manual_ref is not None:
                 base = manual_ref["price"]
@@ -543,14 +619,25 @@ if run:
                     chg_ytd = (price_num - float(base)) / float(base) * 100.0
                     manual_used = True
             else:
-                if exact_yahoo_mode:
-                    chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
+                # 2) Official exchange calendars
+                base_val = None
+                baseline_session = None
+                if use_official_calendars and _HAS_XCALS:
+                    baseline_session = official_prev_year_last_session(tkr, selected_date.year)
+                    if baseline_session is not None:
+                        base_val = baseline_from_hist_on_or_before(hist, baseline_session, use_price_return)
+                # 3) If official available and found, use it; else 4) Yahoo chart; else 5) fallback
+                if base_val is not None and base_val != 0:
+                    chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
                 else:
-                    # Fallback to internal computation (using prior-year last session as baseline)
-                    dates = _session_dates_index(hist)
-                    mask_prev = dates <= date(selected_date.year - 1, 12, 31)
-                    base = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
-                    chg_ytd = ((price_num - base) / base * 100.0) if base else None
+                    if exact_yahoo_mode:
+                        chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
+                    else:
+                        # fallback to prior-year last session in downloaded history
+                        dates = _session_dates_index(hist)
+                        mask_prev = dates <= date(selected_date.year - 1, 12, 31)
+                        base_fallback = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
+                        chg_ytd = ((price_num - base_fallback) / base_fallback * 100.0) if base_fallback else None
 
             rows.append({
                 "Company": s["name"],
@@ -564,7 +651,7 @@ if run:
         except Exception:
             continue
 
-    # --------- Indices (always try to show when toggled) ----------
+    # --------- Indices ----------
     if show_indices:
         idx_defs = [
             {"name": "ISEQ All-Share", "ticker": "^ISEQ"},
