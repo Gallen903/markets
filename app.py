@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, date
 import sqlite3
 import io
 import csv
-from typing import Optional, Dict, List
+from pathlib import Path
+from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
 try:
@@ -16,10 +17,11 @@ except Exception:
     import urllib.request, urllib.parse
     _HTTP_LIB = "urllib"
 
+# --- Timezone helper (ZoneInfo on Python 3.9+) ---
 try:
     from zoneinfo import ZoneInfo
 except Exception:
-    ZoneInfo = None
+    ZoneInfo = None  # fallback to UTC if not available
 
 DB_PATH = "stocks.db"
 
@@ -32,7 +34,6 @@ def get_conn():
 def init_db_with_defaults():
     conn = get_conn()
     cur = conn.cursor()
-    # Stocks table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stocks (
             ticker TEXT PRIMARY KEY,
@@ -41,19 +42,7 @@ def init_db_with_defaults():
             currency TEXT NOT NULL  -- EUR | GBp | USD
         )
     """)
-    # Manual YTD baselines
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reference_prices (
-            ticker TEXT NOT NULL,
-            year   INTEGER NOT NULL,
-            price  REAL NOT NULL,
-            date   TEXT,            -- optional yyyy-mm-dd
-            series TEXT,            -- 'close'|'adjclose' (optional)
-            notes  TEXT,            -- optional
-            PRIMARY KEY (ticker, year)
-        )
-    """)
-
+    # Seed defaults WITHOUT overwriting user entries
     defaults = [
         # --- US ---
         ("STT","State Street Corporation","US","USD"),
@@ -108,7 +97,7 @@ def init_db_with_defaults():
         ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
         ("UPR.IR","Uniphar plc","Ireland","EUR"),
         ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
-        ("PTSB.IR","PTSB Group Holdings plc","Ireland","EUR"),
+        ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
         ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
         ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
         ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
@@ -134,41 +123,26 @@ def init_db_with_defaults():
     conn.commit()
     conn.close()
 
-# reference_prices helpers
-def db_set_reference(ticker: str, year: int, price: float, date_iso: Optional[str], series: Optional[str], notes: Optional[str]):
+def db_all_stocks():
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO reference_prices (ticker,year,price,date,series,notes)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(ticker,year) DO UPDATE SET price=excluded.price,date=excluded.date,series=excluded.series,notes=excluded.notes
-    """, (ticker.strip(), int(year), float(price), (date_iso or None), (series or None), (notes or None)))
-    conn.commit()
-    conn.close()
-
-def db_get_reference(ticker: str, year: int) -> Optional[dict]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT price,date,series,notes FROM reference_prices WHERE ticker=? AND year=?", (ticker.strip(), int(year)))
-    row = cur.fetchone()
-    conn.close()
-    if not row: return None
-    return {"price": float(row[0]), "date": row[1], "series": row[2], "notes": row[3]}
-
-def db_all_references(year: Optional[int] = None) -> pd.DataFrame:
-    conn = get_conn()
-    if year is None:
-        df = pd.read_sql_query("SELECT ticker,year,price,date,series,notes FROM reference_prices", conn)
-    else:
-        df = pd.read_sql_query("SELECT ticker,year,price,date,series,notes FROM reference_prices WHERE year = ?", conn, params=(int(year),))
+    df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", conn)
     conn.close()
     return df
 
-def db_delete_references(keys: List[tuple]):
-    if not keys: return
+def db_add_stock(ticker, name, region, currency):
     conn = get_conn()
     cur = conn.cursor()
-    cur.executemany("DELETE FROM reference_prices WHERE ticker=? AND year=?", keys)
+    cur.execute("INSERT OR REPLACE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
+                (ticker.strip(), name.strip(), region, currency))
+    conn.commit()
+    conn.close()
+
+def db_remove_stocks(tickers):
+    if not tickers:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.executemany("DELETE FROM stocks WHERE ticker = ?", [(t,) for t in tickers])
     conn.commit()
     conn.close()
 
@@ -179,17 +153,37 @@ def currency_symbol(cur: str) -> str:
     return {"USD": "$", "EUR": "€", "GBp": "£"}.get(cur, "")
 
 def _col(use_price_return: bool) -> str:
+    # Yahoo UI uses price return => 'Close'; total return => 'Adj Close'
     return "Close" if use_price_return else "Adj Close"
 
-EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
-def _is_eu_like(ticker: str, region: str) -> bool:
-    t = ticker.upper()
-    return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for suf in EU_SUFFIXES)
+def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
+    """Return array of date() for each row; treat rows as local session dates."""
+    idx = pd.to_datetime(df.index)
+    return np.array([d.date() for d in idx], dtype=object)
+
+def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
+    """Get last session's price on/before target_date using chosen column."""
+    if df.empty:
+        return None, None
+    dates = _session_dates_index(df)
+    mask = dates <= target_date
+    if not mask.any():
+        return None, None
+    pos = np.where(mask)[0][-1]
+    return float(df.iloc[pos][_col(use_price_return)]), pos
+
+def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
+    if df.empty or pos is None:
+        return None
+    ref_pos = pos - n
+    if ref_pos < 0:
+        return None
+    return float(df.iloc[ref_pos][_col(use_price_return)])
 
 # -----------------------------
-# Yahoo chart JSON helpers
+# OPTION A: Yahoo chart endpoint for exact YTD
 # -----------------------------
-def _http_get_json(url: str, params: dict, timeout: float = 12.0) -> Optional[dict]:
+def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         if _HTTP_LIB == "requests":
@@ -205,102 +199,93 @@ def _http_get_json(url: str, params: dict, timeout: float = 12.0) -> Optional[di
     except Exception:
         return None
 
-def chart_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    """Daily Close/Adj Close, indexed by SESSION DATE (date, not datetime). Tight window."""
-    start_dt = pd.to_datetime(start_dt)
-    end_dt = pd.to_datetime(end_dt)
-    p1 = int((start_dt - timedelta(days=2)).timestamp())
-    p2 = int((end_dt + timedelta(days=2)).timestamp())
+def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
+    """
+    Compute YTD % using Yahoo's own chart data (daily 'close' series).
+    Baseline: last close BEFORE Jan 1 of `year` (local to exchange).
+    Numerator: last close ON/BEFORE `on_date` (or live price if today & requested).
+    """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"period1": p1, "period2": p2, "interval": "1d", "includePrePost": "false", "events": "div,splits"}
+    # Use 2y to ensure we capture prior-year EOY sessions for baseline
+    params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
     data = _http_get_json(url, params)
     if not data:
-        return pd.DataFrame()
+        return None
     try:
         result = data["chart"]["result"][0]
-        tzname = result.get("meta", {}).get("exchangeTimezoneName", "UTC")
+        meta = result.get("meta", {})
+        tzname = meta.get("exchangeTimezoneName", "UTC")
         tz = ZoneInfo(tzname) if ZoneInfo else None
+
         stamps = result.get("timestamp", []) or []
-        q = result.get("indicators", {}).get("quote", [{}])[0]
-        closes = q.get("close", []) or []
-        adjc = (result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) or [])
-        rows = []
-        for i, t in enumerate(stamps):
-            c = closes[i] if i < len(closes) else None
-            a = adjc[i] if i < len(adjc) else None
-            if c is None and a is None:
+        closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
+        if not stamps or not closes:
+            return None
+
+        dcs = []
+        for t, c in zip(stamps, closes):
+            if c is None:
                 continue
             dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
-            rows.append({"Session": dt.date(), "Close": c, "Adj Close": a})
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows).drop_duplicates(subset=["Session"], keep="last").set_index("Session")
-        df.index = pd.to_datetime(df.index).date
-        # Trim strictly to window
-        mask = (pd.Series(df.index) >= start_dt.date()) & (pd.Series(df.index) <= end_dt.date())
-        return df.loc[mask.values]
-    except Exception:
-        return pd.DataFrame()
+            dcs.append((dt.date(), float(c)))
+        if not dcs:
+            return None
 
-def yf_series_df(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    """Use yfinance daily, index by SESSION DATE, return Close/Adj Close only."""
-    try:
-        raw = yf.download(symbol, start=start_dt, end=end_dt + timedelta(days=1), progress=False, auto_adjust=False, threads=False)
-    except Exception:
-        return pd.DataFrame()
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    keep = [c for c in ["Close","Adj Close"] if c in raw.columns]
-    if not keep:
-        return pd.DataFrame()
-    df = raw[keep].copy()
-    idx_dates = pd.to_datetime(df.index).date
-    df.insert(0, "Session", idx_dates)
-    df = df.drop_duplicates(subset=["Session"], keep="last").set_index("Session")
-    mask = (pd.Series(df.index) >= pd.to_datetime(start_dt).date()) & (pd.Series(df.index) <= pd.to_datetime(end_dt).date())
-    df = df.loc[mask.values]
-    # Ensure both columns exist
-    if "Close" not in df.columns: df["Close"] = np.nan
-    if "Adj Close" not in df.columns: df["Adj Close"] = np.nan
-    return df
+        # Baseline: last date strictly before Jan 1 of `year`
+        jan1 = date(year, 1, 1)
+        prior = [c for d, c in dcs if d < jan1]
+        if not prior:
+            # fallback: baseline = first available in the year
+            in_year = [c for d, c in dcs if d >= jan1]
+            if not in_year:
+                return None
+            base = in_year[0]
+        else:
+            base = prior[-1]
 
-def get_series(symbol: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp, prefer_chart: bool) -> pd.DataFrame:
-    """Prefer chart feed for EU/IR; otherwise try yfinance then chart. Never returns future rows."""
-    if prefer_chart:
-        df = chart_series_df(symbol, start_dt, end_dt)
-        if df is None or df.empty:
-            df = yf_series_df(symbol, start_dt, end_dt)
-    else:
-        df = yf_series_df(symbol, start_dt, end_dt)
-        if df is None or df.empty:
-            df = chart_series_df(symbol, start_dt, end_dt)
-    # Final safety: guarantee both columns exist
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if "Close" not in df.columns: df["Close"] = np.nan
-    if "Adj Close" not in df.columns: df["Adj Close"] = np.nan
-    return df
+        # Value for on_date (latest <= on_date)
+        last_vals = [c for d, c in dcs if d <= on_date]
+        if not last_vals:
+            return None
+        last_close = last_vals[-1]
+
+        # Optional: use live when on_date == today (mirrors Yahoo summary)
+        if use_live_when_today and on_date == date.today():
+            try:
+                fi = yf.Ticker(symbol).fast_info
+                live = fi.get("last_price") or fi.get("regular_market_price")
+                if live is not None:
+                    last_close = float(live)
+            except Exception:
+                pass
+
+        if base == 0:
+            return None
+        return (last_close - base) / base * 100.0
+    except Exception:
+        return None
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, and YTD % change. Manual baselines let you lock exact YTD for Irish/EU tickers.")
+st.caption("Last price, 5-day % change, and YTD % change. YTD can be computed from Yahoo's chart feed for exact parity.")
 
+# Toggles
 use_price_return = st.toggle(
     "Match Yahoo style for returns (use Close; live price if today)",
     value=True,
-    help="ON = price return (Close). OFF = total return (Adj Close). Live price used ONLY if the selected date is today."
+    help="ON = price return (Close). OFF = total return (Adj Close). Live price used for today's numerator."
 )
-use_manual_baselines = st.toggle(
-    "Use manual YTD baselines when available",
+exact_yahoo_mode = st.toggle(
+    "Exact Yahoo YTD (chart feed)",
     value=True,
-    help="If a manual baseline exists for (ticker, year), it overrides auto baselines for YTD %."
+    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
 )
 
 init_db_with_defaults()
-stocks_df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", get_conn())
+stocks_df = db_all_stocks()
 
 colA, colB = st.columns([1,1])
 with colA:
@@ -309,7 +294,7 @@ with colB:
     st.write(" ")
     run = st.button("Run")
 
-# ---- Add/remove stocks
+# Editor: add/remove stocks
 with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
@@ -320,10 +305,7 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
         a_curr   = st.selectbox("Currency", ["EUR", "GBp", "USD"])
         if st.button("Add / Update"):
             if a_ticker and a_name:
-                db_add_conn = get_conn()
-                db_add_conn.execute("INSERT OR REPLACE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
-                                    (a_ticker.strip(), a_name.strip(), a_region, a_curr))
-                db_add_conn.commit(); db_add_conn.close()
+                db_add_stock(a_ticker, a_name, a_region, a_curr)
                 st.success(f"Saved {a_name} ({a_ticker})")
             else:
                 st.warning("Please provide at least Ticker and Company name.")
@@ -333,15 +315,17 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
         rem_sel = st.multiselect("Select to remove", rem_choices, [])
         if st.button("Remove selected"):
             tickers = [s[s.rfind("(")+1:-1] for s in rem_sel]
-            conn_rm = get_conn()
-            conn_rm.executemany("DELETE FROM stocks WHERE ticker = ?", [(t,) for t in tickers])
-            conn_rm.commit(); conn_rm.close()
+            db_remove_stocks(tickers)
             st.success(f"Removed {len(tickers)} stock(s)")
 
-# ----- Selection
-stocks_df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", get_conn())
+# Stock selection for this run
+stocks_df = db_all_stocks()
 stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
-sel_labels = st.multiselect("Stocks to include in this run:", list(stock_options.keys()), default=list(stock_options.keys()))
+sel_labels = st.multiselect(
+    "Stocks to include in this run:",
+    list(stock_options.keys()),
+    default=list(stock_options.keys())
+)
 selected_stocks = [stock_options[label] for label in sel_labels]
 
 # -----------------------------
@@ -349,103 +333,57 @@ selected_stocks = [stock_options[label] for label in sel_labels]
 # -----------------------------
 if run:
     rows = []
-    target_date = pd.to_datetime(selected_date).date()
+    target_dt = pd.to_datetime(selected_date)
+    target_date = target_dt.date()
     today_date = date.today()
-    grace_days = 2  # enough for Fri→Sat/Sun UTC stamp
-
-    window_start = date(selected_date.year - 1, 12, 15)
-    window_end   = target_date + timedelta(days=grace_days)
 
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            prefer_chart = _is_eu_like(tkr, s["region"])
-            series_df = get_series(tkr, pd.to_datetime(window_start), pd.to_datetime(window_end), prefer_chart=prefer_chart)
-            if series_df is None or series_df.empty:
+            # Pull enough history for 5D calculation and display; session-date indexing
+            hist = yf.download(
+                tkr,
+                start=f"{selected_date.year-1}-12-15",
+                end=selected_date + timedelta(days=7),
+                progress=False,
+                auto_adjust=False,
+            )
+            if hist.empty:
                 continue
 
-            sessions = pd.Index(series_df.index)
-            if len(sessions) == 0:
-                continue
-            # last session <= selected_date + grace
-            mask = sessions <= pd.to_datetime(window_end).date()
-            if not mask.any():
-                continue
-            pos = np.where(mask)[0][-1]
-
-            # Choose a price EVEN IF one series is missing
-            close_val = series_df.iloc[pos]["Close"] if "Close" in series_df.columns else np.nan
-            adj_val   = series_df.iloc[pos]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
-
-            def pick_price(prefer_close: bool, c, a):
-                if prefer_close:
-                    return float(c) if pd.notnull(c) else (float(a) if pd.notnull(a) else None)
-                else:
-                    return float(a) if pd.notnull(a) else (float(c) if pd.notnull(c) else None)
-
-            price_eod = pick_price(use_price_return, close_val, adj_val)
-            if price_eod is None:
+            # Last session on/before selected date (for display & 5D reference)
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
+            if pos is None:
                 continue
 
-            price_num = price_eod
-            if use_price_return and (target_date == today_date):
+            # If matching Yahoo style and selected date is today, prefer LIVE price for display/5D/YTD numerators
+            use_live = use_price_return and (target_date == today_date)
+            live_price = None
+            if use_live:
                 try:
                     fi = yf.Ticker(tkr).fast_info
-                    live = fi.get("last_price") or fi.get("regular_market_price")
-                    if live is not None:
-                        price_num = float(live)
+                    live_price = fi.get("last_price") or fi.get("regular_market_price")
                 except Exception:
-                    pass
+                    live_price = None
 
-            # 5D change (use SAME selection rule as price)
-            ref_pos = pos - 5
+            # Numerator price (today's live if available; else EOD close)
+            price_num = float(live_price) if (live_price is not None) else float(price_eod)
+
+            # 5D change uses n sessions back from the EOD position
+            c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
             chg_5d = None
-            if ref_pos >= 0:
-                rv_close = series_df.iloc[ref_pos]["Close"] if "Close" in series_df.columns else np.nan
-                rv_adj   = series_df.iloc[ref_pos]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
-                ref_val = pick_price(use_price_return, rv_close, rv_adj)
-                if ref_val is not None and ref_val != 0:
-                    chg_5d = (price_num - ref_val) / ref_val * 100.0
+            if c_5ago is not None and c_5ago != 0:
+                chg_5d = (price_num - c_5ago) / c_5ago * 100.0
 
-            # YTD change
-            chg_ytd = None
-            manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
-            if manual_ref is not None:
-                base = manual_ref["price"]
-                if base:
-                    chg_ytd = (price_num - float(base)) / float(base) * 100.0
+            # YTD %
+            if exact_yahoo_mode:
+                chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
             else:
-                # Auto baseline from same series
-                if prefer_chart:
-                    # EU/IR: Yahoo-like – use Adj Close if available, anchor <= Dec 27
-                    cutoff = date(selected_date.year - 1, 12, 27)
-                    idxs = [i for i, d in enumerate(series_df.index) if d <= cutoff]
-                    if idxs:
-                        base_c = series_df.iloc[idxs[-1]]["Close"] if "Close" in series_df.columns else np.nan
-                        base_a = series_df.iloc[idxs[-1]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
-                        base_val = pick_price(False, base_c, base_a)  # prefer adj for EU
-                    else:
-                        base_val = np.nan
-                else:
-                    # Others: price-return baseline = last session strictly before Jan 1 using Close (fall back to Adj if Close missing)
-                    jan1 = date(selected_date.year, 1, 1)
-                    idxs = [i for i, d in enumerate(series_df.index) if d < jan1]
-                    if idxs:
-                        base_c = series_df.iloc[idxs[-1]]["Close"] if "Close" in series_df.columns else np.nan
-                        base_a = series_df.iloc[idxs[-1]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
-                        base_val = pick_price(True, base_c, base_a)   # prefer close
-                    else:
-                        # if no prior session, take first in-year with same preference
-                        in_idx = [i for i, d in enumerate(series_df.index) if d >= jan1]
-                        if in_idx:
-                            base_c = series_df.iloc[in_idx[0]]["Close"] if "Close" in series_df.columns else np.nan
-                            base_a = series_df.iloc[in_idx[0]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
-                            base_val = pick_price(True, base_c, base_a)
-                        else:
-                            base_val = np.nan
-
-                if pd.notnull(base_val) and float(base_val) != 0.0:
-                    chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
+                # Fallback to internal computation (using prior-year last session as baseline)
+                dates = _session_dates_index(hist)
+                mask_prev = dates <= date(selected_date.year - 1, 12, 31)
+                base = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
+                chg_ytd = ((price_num - base) / base * 100.0) if base else None
 
             rows.append({
                 "Company": s["name"],
@@ -461,7 +399,12 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        df = pd.DataFrame(rows).sort_values(by=["Region", "Company"]).reset_index(drop=True)
+        # build & sort the result table
+        df = (
+            pd.DataFrame(rows)
+              .sort_values(by=["Region", "Company"])
+              .reset_index(drop=True)
+        )
 
         region_order = ["Ireland", "UK", "Europe", "US"]
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
@@ -487,6 +430,7 @@ if run:
 
         output = io.StringIO()
         writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
         for region in region_order:
             g = df[df["Region"] == region]
             if g.empty:
