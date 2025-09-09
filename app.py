@@ -184,7 +184,6 @@ def _col(use_price_return: bool) -> str:
 EU_SUFFIXES = (".IR", ".PA", ".MC", ".AS", ".BR", ".MI", ".NL", ".BE")
 def _is_eu_like(ticker: str, region: str) -> bool:
     t = ticker.upper()
-    # FIXED: correct variable name in the generator
     return (region in ("Ireland", "Europe")) or any(t.endswith(suf) for suf in EU_SUFFIXES)
 
 # -----------------------------
@@ -339,73 +338,11 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             conn_rm.commit(); conn_rm.close()
             st.success(f"Removed {len(tickers)} stock(s)")
 
-# ---- Manual YTD baselines UI
-with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
-    cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
-    st.caption("Define the **baseline price** used for YTD % for that ticker in this year (EUR/GBp/USD).")
-
-    c1, c2, c3, c4 = st.columns([1.2, 0.8, 0.8, 1])
-    with c1: b_ticker = st.text_input("Ticker (exact)", placeholder="A5G.IR")
-    with c2: b_price  = st.text_input("Baseline price", placeholder="e.g. 4.25")
-    with c3: b_series = st.selectbox("Series", ["close","adjclose"])
-    with c4: b_date   = st.text_input("Baseline date (optional, yyyy-mm-dd)", placeholder="2024-12-27")
-    b_notes = st.text_input("Notes (optional)", placeholder="e.g. Dec 27 adjclose from Yahoo")
-
-    if st.button("Add / Update baseline"):
-        try:
-            db_set_reference(b_ticker, int(cur_year), float(b_price), b_date.strip() or None, b_series, b_notes.strip() or None)
-            st.success(f"Baseline saved for {b_ticker} ({cur_year}): {b_price}")
-        except Exception as e:
-            st.error(f"Could not save baseline: {e}")
-
-    st.markdown("**Bulk import / export** (CSV: ticker,year,price,date,series,notes)")
-    up = st.file_uploader("Upload CSV", type=["csv"])
-    if up is not None:
-        try:
-            imp = pd.read_csv(up)
-            for _, r in imp.iterrows():
-                db_set_reference(
-                    str(r.get("ticker")), int(r.get("year")), float(r.get("price")),
-                    None if pd.isna(r.get("date")) else str(r.get("date")),
-                    None if pd.isna(r.get("series")) else str(r.get("series")),
-                    None if pd.isna(r.get("notes")) else str(r.get("notes")),
-                )
-            st.success(f"Imported/updated {len(imp)} baseline(s).")
-        except Exception as e:
-            st.error(f"Import failed: {e}")
-
-    refs_df = db_all_references(cur_year).sort_values(["ticker","year"])
-    st.dataframe(refs_df, use_container_width=True)
-    if not refs_df.empty:
-        out_csv = io.StringIO(); refs_df.to_csv(out_csv, index=False)
-        st.download_button("⬇️ Download current year's baselines CSV", data=out_csv.getvalue(),
-                           file_name=f"ytd_baselines_{cur_year}.csv", mime="text/csv")
-
-        del_opts = [f"{r['ticker']} ({r['year']})" for _, r in refs_df.iterrows()]
-        del_sel = st.multiselect("Delete baselines", del_opts, [])
-        if st.button("Delete selected baselines"):
-            keys = []
-            for s in del_sel:
-                t = s[:s.rfind("(")].strip()
-                y = int(s[s.rfind("(")+1:-1])
-                keys.append((t,y))
-            db_delete_references(keys)
-            st.success(f"Deleted {len(keys)} baseline(s).")
-
 # ----- Selection
 stocks_df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", get_conn())
 stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
 sel_labels = st.multiselect("Stocks to include in this run:", list(stock_options.keys()), default=list(stock_options.keys()))
 selected_stocks = [stock_options[label] for label in sel_labels]
-
-# -----------------------------
-# Pricing utilities
-# -----------------------------
-def pick_price(prefer_close: bool, c, a):
-    if prefer_close:
-        return float(c) if pd.notnull(c) else (float(a) if pd.notnull(a) else None)
-    else:
-        return float(a) if pd.notnull(a) else (float(c) if pd.notnull(c) else None)
 
 # -----------------------------
 # Run calculation
@@ -439,6 +376,13 @@ if run:
             # Choose a price EVEN IF one series is missing
             close_val = series_df.iloc[pos]["Close"] if "Close" in series_df.columns else np.nan
             adj_val   = series_df.iloc[pos]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
+
+            def pick_price(prefer_close: bool, c, a):
+                if prefer_close:
+                    return float(c) if pd.notnull(c) else (float(a) if pd.notnull(a) else None)
+                else:
+                    return float(a) if pd.notnull(a) else (float(c) if pd.notnull(c) else None)
+
             price_eod = pick_price(use_price_return, close_val, adj_val)
             if price_eod is None:
                 continue
@@ -453,7 +397,7 @@ if run:
                 except Exception:
                     pass
 
-            # 5D change
+            # 5D change (use SAME selection rule as price)
             ref_pos = pos - 5
             chg_5d = None
             if ref_pos >= 0:
@@ -463,19 +407,17 @@ if run:
                 if ref_val is not None and ref_val != 0:
                     chg_5d = (price_num - ref_val) / ref_val * 100.0
 
-            # YTD change (+ badge if manual baseline used)
-            manual_used = False
+            # YTD change
             chg_ytd = None
             manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
             if manual_ref is not None:
                 base = manual_ref["price"]
                 if base:
                     chg_ytd = (price_num - float(base)) / float(base) * 100.0
-                    manual_used = True
             else:
                 # Auto baseline from same series
                 if prefer_chart:
-                    # EU/IR: Yahoo-like – prefer Adj Close, anchor <= Dec 27
+                    # EU/IR: Yahoo-like – use Adj Close if available, anchor <= Dec 27
                     cutoff = date(selected_date.year - 1, 12, 27)
                     idxs = [i for i, d in enumerate(series_df.index) if d <= cutoff]
                     if idxs:
@@ -493,6 +435,7 @@ if run:
                         base_a = series_df.iloc[idxs[-1]]["Adj Close"] if "Adj Close" in series_df.columns else np.nan
                         base_val = pick_price(True, base_c, base_a)   # prefer close
                     else:
+                        # if no prior session, take first in-year with same preference
                         in_idx = [i for i, d in enumerate(series_df.index) if d >= jan1]
                         if in_idx:
                             base_c = series_df.iloc[in_idx[0]]["Close"] if "Close" in series_df.columns else np.nan
@@ -506,7 +449,6 @@ if run:
 
             rows.append({
                 "Company": s["name"],
-                "Manual": "🧭" if manual_used else "",
                 "Region": s["region"],
                 "Currency": s["currency"],
                 "Price": round(price_num, 1),
@@ -525,8 +467,6 @@ if run:
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
         df = df.sort_values(["Region", "Company"])
 
-        # Display per region, keeping the new badge column
-        display_cols = ["Company","Manual","Price","5D % Change","YTD % Change"]
         for region in region_order:
             g = df[df["Region"] == region]
             if g.empty:
@@ -535,9 +475,9 @@ if run:
             curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
             header = f"{region} ({curr_label})" if curr_label else region
             st.subheader(header)
-            st.dataframe(g[display_cols], use_container_width=True)
+            st.dataframe(g.drop(columns=["Region", "Currency"]), use_container_width=True)
 
-        # CSV export (unchanged format; badge not included)
+        # CSV export
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
             "UK":      f"UK ({currency_symbol('GBp')})",
