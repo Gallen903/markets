@@ -348,7 +348,7 @@ use_manual_baselines = st.toggle(
     value=True,
     help="If a manual baseline exists for (ticker, year), it overrides the automatic YTD baseline."
 )
-# New: rounding toggle
+# Rounding
 round_two_dp = st.toggle(
     "Round to 2 decimal places (off = 1 dp)",
     value=False,
@@ -357,6 +357,16 @@ round_two_dp = st.toggle(
 DP = 2 if round_two_dp else 1
 price_fmt = f"{{:.{DP}f}}"
 pct_fmt   = f"{{:.{DP}f}}"
+
+# Indices
+show_indices = st.toggle(
+    "Show index 5-day trends (ISEQ, FTSE 100, S&P 500, DAX)",
+    value=True
+)
+show_index_charts = st.checkbox(
+    "Mini charts for indices (last ~10 sessions)",
+    value=False
+)
 
 init_db_with_defaults()
 stocks_df = db_all_stocks()
@@ -484,6 +494,7 @@ if run:
     target_date = target_dt.date()
     today_date = date.today()
 
+    # --------- Stocks ----------
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
@@ -553,6 +564,56 @@ if run:
         except Exception:
             continue
 
+    # --------- Indices (always try to show when toggled) ----------
+    if show_indices:
+        idx_defs = [
+            {"name": "ISEQ All-Share", "ticker": "^ISEQ"},
+            {"name": "FTSE 100",       "ticker": "^FTSE"},
+            {"name": "S&P 500",        "ticker": "^GSPC"},
+            {"name": "DAX",            "ticker": "^GDAXI"},
+        ]
+        chart_cols = st.columns(len(idx_defs)) if show_index_charts else None
+        idx_rows = []
+        for i, info in enumerate(idx_defs):
+            try:
+                h = yf.download(
+                    info["ticker"],
+                    start=selected_date - timedelta(days=30),
+                    end=selected_date + timedelta(days=7),
+                    progress=False,
+                    auto_adjust=False,
+                )
+                if h is None or h.empty:
+                    continue
+
+                last_lvl, pos_lvl = last_close_on_or_before_date(h, target_date, use_price_return=True)
+                if pos_lvl is None:
+                    continue
+
+                lvl_5ago = close_n_trading_days_ago_by_pos(h, pos_lvl, 5, use_price_return=True)
+                chg_5d_idx = None
+                if lvl_5ago is not None and lvl_5ago != 0:
+                    chg_5d_idx = (last_lvl - lvl_5ago) / lvl_5ago * 100.0
+
+                idx_rows.append({
+                    "Index": info["name"],
+                    "Level": round(last_lvl, DP),
+                    "5D % Change": round(chg_5d_idx, DP) if chg_5d_idx is not None else None,
+                })
+
+                if show_index_charts:
+                    series = h["Close"].dropna().tail(10)
+                    with chart_cols[i]:
+                        st.caption(info["name"])
+                        st.line_chart(series)
+            except Exception:
+                continue
+
+        if idx_rows:
+            st.subheader("Major indices — 5-day trend")
+            st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
+
+    # --------- Stocks table / CSV ----------
     if not rows:
         st.warning("No stock data available for that date.")
     else:
