@@ -109,8 +109,8 @@ def init_db_with_defaults():
         # --- UK ---
         ("VOD.L","Vodafone Group","UK","GBp"),
         ("DCC.L","DCC plc","UK","GBp"),
-        ("GNCL.XC","Greencore Group plc","UK","GBp"),
-        ("GFTUL.XC","Grafton Group plc","UK","GBp"),
+        ("GNC.L","Greencore Group plc","UK","GBp"),
+        ("GFTU.L","Grafton Group plc","UK","GBp"),
         ("HVO.L","hVIVO plc","UK","GBp"),
         ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
         ("TSCOL.XC","Tesco plc","UK","GBp"),
