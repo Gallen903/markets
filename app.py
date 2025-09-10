@@ -103,7 +103,7 @@ def init_db_with_defaults():
         # Added primaries:
         ("IBE.MC","Iberdrola S.A.","Europe","EUR"),    # Madrid (primary)
         ("ORSTED.CO","Orsted A/S","Europe","DKK"),     # Copenhagen (primary)
-        ("ROG.SW","Roche Holding AG","Europe","CHF"),  # SIX Swiss (primary)
+        ("ROG.SW","Roche Holding AG (CHF)","Europe","CHF"),  # SIX Swiss (primary)
         ("SAN.PA","Sanofi","Europe","EUR"),            # Paris (primary)
 
         # --- UK ---
