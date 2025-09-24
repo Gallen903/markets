@@ -39,8 +39,8 @@ DB_PATH = "stocks.db"
 # =============================
 # GitHub-backed storage (CSV in repo)
 # =============================
-GH_STOCKS_PATH = "data/stocks.csv"
-GH_BASELINES_PATH = "data/reference_prices.csv"
+GH_STOCKS_PATH = "https://github.com/Gallen903/markets/blob/main/data/Stocks"
+GH_BASELINES_PATH = "https://github.com/Gallen903/markets/blob/main/data/reference_prices"
 
 # --- Auth headers (supports classic 'token' and fine-grained 'Bearer') ---
 def _gh_headers_auth(scheme: str = "token"):
