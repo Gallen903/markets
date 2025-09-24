@@ -1,1 +1,74 @@
-Ticker,name,region,Currency
+ticker,name,region,currency
+A5G.IR,AIB Group plc,Ireland,EUR
+ABBV,AbbVie Inc.,US,USD
+ABT,Abbott Laboratories,US,USD
+AER,AerCap Holdings,US,USD
+GOOG,Alphabet Inc.,US,USD
+AMGN,Amgen Inc.,US,USD
+ADI,"Analog Devices, Inc.",US,USD
+AAPL,Apple Inc.,US,USD
+YZA.IR,Arytza,Ireland,EUR
+ABF.L,Associated British Foods,UK,GBp
+BIRG.IR,Bank of Ireland Group plc,Ireland,EUR
+BKT.MC,Bankinter,Europe,EUR
+BSX,Boston Scientific Corporation,US,USD
+BMY,Bristol-Myers Squibb Company,UK,USD
+BRBY.L,Burberry,UK,GBp
+CRH,CRH plc,US,USD
+C5H.IR,Cairn Homes plc,Ireland,EUR
+COKE,"Coca-Cola Consolidated, Inc.",US,USD
+DCC.L,DCC plc,UK,GBp
+DHG.IR,Dalata Hotel Group plc,Ireland,EUR
+BSN.F,Danone S.A.,Europe,EUR
+DEO,Diageo,US,USD
+DQ7A.IR,Donegal Investment Group plc,Ireland,EUR
+LLY,Eli Lilly and Company,US,USD
+EG7.IR,FBD Holdings plc,Ireland,EUR
+FLUT,Flutter Entertainment plc,US,USD
+GE,GE Aerospace,US,USD
+GL9.IR,Glanbia plc,Ireland,EUR
+GVR.IR,Glenveagh Properties PLC,Ireland,EUR
+GFTUL.XC,Grafton Group plc,UK,GBp
+GFTU.L,Grafton Group plc,UK,GBp
+GWMO.L,Great Western Mining Corp,UK,GBp
+GRP.IR,Greencoat Renewables,Ireland,EUR
+GNCL.XC,Greencore Group plc,UK,GBp
+GNC.L,Greencore Group plc,UK,GBp
+HPQ,HP Inc.,US,USD
+HEIA.AS,Heineken N.V.,Europe,EUR
+HSW.IR,Hostelworld Group plc,Ireland,EUR
+IBE.MC,Iberdrola S.A.,Europe,EUR
+ICON,Icon Energy Corp.,US,USD
+INTC,Intel Corporation,US,USD
+IRES.IR,Ires Reit Plc,Ireland,EUR
+IR5B.IR,Irish Continental Group plc,Ireland,EUR
+JNJ,Johnson & Johnson,US,USD
+KMR.IR,Kenmare Resources plc,Ireland,EUR
+KRZ.IR,Kerry Group plc,Ireland,EUR
+KRX.IR,Kingspan Group plc,Ireland,EUR
+MLC.IR,Malin Corporation plc,Ireland,EUR
+MRK,"Merck & Co., Inc.",US,USD
+META,"Meta Platforms, Inc.",US,USD
+MSFT,Microsoft Corporation,US,USD
+NVS,Novartis AG,US,USD
+ORCL,Oracle Corporation,US,USD
+OIZ.IR,Origin Enterprises plc,Ireland,EUR
+ORSTED.CO,Orsted A/S,Europe,DKK
+PTSB.IR,PTSB Holdings plc,Ireland,EUR
+PEP,"PepsiCo, Inc.",US,USD
+PFE,Pfizer Inc.,US,USD
+POLB.L,Poolbeg Pharma PLC,UK,GBp
+ROG.SW,Roche Holding AG (CHF),Europe,CHF
+RYA.IR,Ryanair Holdings plc,Ireland,EUR
+SSPG.L,SSP Group,UK,GBp
+SAN.PA,Sanofi,Europe,EUR
+SW,Smurfit Westrock Plc,US,USD
+SBUX,Starbucks Corporation,US,USD
+STT,State Street Corporation,US,USD
+TSCO.L,Tesco plc,UK,GBp
+TSCOL.XC,Tesco plc,UK,GBp
+TSLA,Tesla,US,USD
+UPR.IR,Uniphar plc,Ireland,EUR
+VOD.L,Vodafone Group,UK,GBp
+EBAY,eBay Inc.,US,USD
+HVO.L,hVIVO plc,UK,GBp
