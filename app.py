@@ -39,7 +39,7 @@ DB_PATH = "stocks.db"
 # =============================
 # GitHub-backed storage (CSV in repo)
 # =============================
-GH_STOCKS_PATH = "data/Stocks.csv"
+GH_STOCKS_PATH = "data/stocks.csv"
 GH_BASELINES_PATH = "data/reference_prices.csv"
 
 # --- Auth headers (supports classic 'token' and fine-grained 'Bearer') ---
