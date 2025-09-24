@@ -9,6 +9,7 @@ import io
 import csv
 import os
 import base64
+import json
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
@@ -41,15 +42,21 @@ DB_PATH = "stocks.db"
 GH_STOCKS_PATH = "data/stocks.csv"
 GH_BASELINES_PATH = "data/reference_prices.csv"
 
-def _gh_headers():
+# --- Auth headers (supports classic 'token' and fine-grained 'Bearer') ---
+def _gh_headers_auth(scheme: str = "token"):
     tok = st.secrets.get("GITHUB_TOKEN")
     if not tok:
         return None
+    auth = f"{'Bearer' if scheme.lower()=='bearer' else 'token'} {tok}"
     return {
-        "Authorization": f"token {tok}",
+        "Authorization": auth,
         "Accept": "application/vnd.github+json",
         "User-Agent": "streamlit-app",
+        "Content-Type": "application/json",
     }
+
+def _gh_headers():  # keep old name for callers
+    return _gh_headers_auth("token")
 
 def _gh_repo():
     repo = st.secrets.get("GITHUB_REPO")
@@ -57,28 +64,36 @@ def _gh_repo():
     return repo, branch
 
 def gh_get_file(path: str):
-    headers = _gh_headers()
     repo, branch = _gh_repo()
-    if not headers or not repo:
+    if not repo:
         return None
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    try:
-        if _HTTP_LIB == "requests":
-            r = requests.get(url, params={"ref": branch}, headers=headers, timeout=20)
-            return r.json() if r.status_code == 200 else None
-        else:
-            full = f"{url}?{urllib.parse.urlencode({'ref': branch})}"
-            req = urllib.request.Request(full, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                import json
-                return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
+    for scheme in ("token", "bearer"):
+        headers = _gh_headers_auth(scheme)
+        if not headers:
+            return None
+        try:
+            if _HTTP_LIB == "requests":
+                r = requests.get(url, params={"ref": branch}, headers=headers, timeout=20)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code == 401:
+                    continue  # try next scheme
+                return None
+            else:
+                full = f"{url}?{urllib.parse.urlencode({'ref': branch})}"
+                req = urllib.request.Request(full, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            if scheme == "bearer":
+                return None
+            continue
+    return None
 
 def gh_put_file(path: str, content_bytes: bytes, message: str, sha: Optional[str]):
-    headers = _gh_headers()
     repo, branch = _gh_repo()
-    if not headers or not repo:
+    if not repo:
         return False, "GitHub not configured"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {
@@ -88,19 +103,30 @@ def gh_put_file(path: str, content_bytes: bytes, message: str, sha: Optional[str
     }
     if sha:
         payload["sha"] = sha
-    try:
-        if _HTTP_LIB == "requests":
-            r = requests.put(url, headers=headers, json=payload, timeout=30)
-            if r.status_code in (200, 201):
-                return True, "Committed"
-            return False, f"{r.status_code}: {r.text[:200]}"
-        else:
-            data = urllib.parse.urlencode(payload).encode("utf-8")
-            req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return True, "Committed"
-    except Exception as e:
-        return False, f"Commit failed: {e}"
+    body = json.dumps(payload).encode("utf-8")
+
+    for scheme in ("token", "bearer"):
+        headers = _gh_headers_auth(scheme)
+        try:
+            if _HTTP_LIB == "requests":
+                r = requests.put(url, headers=headers, json=payload, timeout=30)
+                if r.status_code in (200, 201):
+                    return True, "Committed"
+                if r.status_code == 401:
+                    continue  # try alternate scheme
+                return False, f"{r.status_code}: {r.text[:200]}"
+            else:
+                req = urllib.request.Request(url, data=body, headers=headers, method="PUT")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    code = resp.getcode()
+                    if code in (200, 201):
+                        return True, "Committed"
+                    return False, f"{code}: {resp.read(200)}"
+        except Exception as e:
+            if scheme == "bearer":
+                return False, f"Commit failed: {e}"
+            continue
+    return False, "401: Bad credentials (check token scope/SSO/repo access)"
 
 def seed_db_from_github():
     """Fetch CSVs from repo and upsert into local SQLite tables."""
@@ -146,8 +172,7 @@ def seed_db_from_github():
 
 def sync_db_to_github(note: str = ""):
     """Dump both tables to CSV and commit to repo."""
-    headers = _gh_headers()
-    if not headers or not _gh_repo()[0]:
+    if not _gh_repo()[0] or not _gh_headers():
         return False, "GitHub not configured"
 
     # Stocks
@@ -404,7 +429,6 @@ def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[di
             full = f"{url}?{urllib.parse.urlencode(params)}"
             req = urllib.request.Request(full, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                import json
                 return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -545,6 +569,32 @@ with st.sidebar:
             seed_db_from_github()
             st.success("Pulled latest from repo.")
             st.rerun()
+        if st.button("🔎 Test GitHub token", key="test_token"):
+            for scheme in ("token", "bearer"):
+                hdrs = _gh_headers_auth(scheme)
+                try:
+                    if _HTTP_LIB == "requests":
+                        r = requests.get("https://api.github.com/user", headers=hdrs, timeout=10)
+                        code = r.status_code
+                        body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+                    else:
+                        req = urllib.request.Request("https://api.github.com/user", headers=hdrs)
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            code = resp.getcode()
+                            body = json.loads(resp.read().decode("utf-8"))
+                    if code == 200:
+                        login = body.get("login") if isinstance(body, dict) else body
+                        scopes = r.headers.get("X-OAuth-Scopes","") if _HTTP_LIB=="requests" else "(n/a)"
+                        st.success(f"Authenticated as **{login}** using **{scheme}**. Scopes: {scopes}")
+                        break
+                    elif code == 401:
+                        st.warning(f"401 with {scheme} auth — trying alternate…")
+                        continue
+                    else:
+                        st.error(f"/user returned {code}: {str(body)[:200]}")
+                        break
+                except Exception as e:
+                    st.error(f"Token test error: {e}")
     else:
         st.warning("Set GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH in st.secrets.")
 
