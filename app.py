@@ -935,7 +935,7 @@ if run:
         except Exception:
             continue
 
-    # --------- Indices (with exportable downloads) ----------
+    # --------- Indices (with exportable downloads incl. mini-chart data) ----------
     if show_indices:
         idx_defs = [
             {"name": "ISEQ All-Share", "ticker": "^ISEQ"},
@@ -945,10 +945,13 @@ if run:
         ]
         chart_cols = st.columns(len(idx_defs)) if show_index_charts else None
 
-        idx_rows = []        # summary (level + 5D %)
-        tidy_rows = []       # long format last 6 sessions
-        wide_dict = {}       # name -> Series of last 6 closes
+        idx_rows = []          # summary (level + 5D %)
+        tidy_rows = []         # long format last 6 sessions (base100)
+        wide_dict = {}         # name -> Series of last 6 closes
         date_index_for_wide = None
+
+        # NEW: collect the exact mini-chart series (last ~10 sessions, Close)
+        minichart_rows = []    # long tidy: date, index, close (last ~10)
 
         for i, info in enumerate(idx_defs):
             try:
@@ -996,15 +999,25 @@ if run:
                         "base100": round(b, DP) if pd.notnull(b) else None
                     })
 
-                series = pd.Series(closes.values, index=window["DateOnly"].astype(str).values, name=info["name"])
-                date_index_for_wide = series.index  # last one wins (same length across)
-                wide_dict[info["name"]] = series
+                series6 = pd.Series(closes.values, index=window["DateOnly"].astype(str).values, name=info["name"])
+                date_index_for_wide = series6.index  # last one wins (same length across)
+                wide_dict[info["name"]] = series6
+
+                # --- Mini chart series (exact data shown in the charts): last ~10 sessions (Close)
+                series_chart = h["Close"].dropna().tail(10)
+                # collect even if charts are hidden, so the download has the data
+                for dt_idx, v in series_chart.items():
+                    minichart_rows.append({
+                        "date": pd.to_datetime(dt_idx).date().isoformat(),
+                        "index": info["name"],
+                        "close": round(float(v), DP)
+                    })
 
                 if show_index_charts:
-                    series_chart = h["Close"].dropna().tail(10)
                     with chart_cols[i]:
                         st.caption(info["name"])
                         st.line_chart(series_chart)
+
             except Exception:
                 continue
 
@@ -1048,6 +1061,18 @@ if run:
                     "⬇️ Download indices (wide, last 6 sessions).csv",
                     data=out_wide.getvalue(),
                     file_name=f"indices_wide_last6_{selected_date.isoformat()}.csv",
+                    mime="text/csv"
+                )
+
+            # 4) Mini-chart data (exact series shown in the line charts)
+            if minichart_rows:
+                mini_df = pd.DataFrame(minichart_rows).sort_values(["index","date"])
+                out_mini = io.StringIO()
+                mini_df.to_csv(out_mini, index=False)
+                st.download_button(
+                    "⬇️ Download mini-chart data (last ~10 sessions, tidy).csv",
+                    data=out_mini.getvalue(),
+                    file_name=f"indices_minicharts_last10_{selected_date.isoformat()}.csv",
                     mime="text/csv"
                 )
 
