@@ -324,7 +324,7 @@ def db_add_stock(ticker, name, region, currency):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
-        (ticker.strip(), name.strip(), region, currency))
+                (ticker.strip(), name.strip(), region, currency))
     conn.commit()
     conn.close()
 
@@ -935,7 +935,7 @@ if run:
         except Exception:
             continue
 
-    # --------- Indices (with exportable downloads incl. mini-chart data) ----------
+    # --------- Indices ----------
     if show_indices:
         idx_defs = [
             {"name": "ISEQ All-Share", "ticker": "^ISEQ"},
@@ -944,15 +944,7 @@ if run:
             {"name": "DAX",            "ticker": "^GDAXI"},
         ]
         chart_cols = st.columns(len(idx_defs)) if show_index_charts else None
-
-        idx_rows = []          # summary (level + 5D %)
-        tidy_rows = []         # long format last 6 sessions (base100)
-        wide_dict = {}         # name -> Series of last 6 closes
-        date_index_for_wide = None
-
-        # NEW: collect the exact mini-chart series (last ~10 sessions, Close)
-        minichart_rows = []    # long tidy: date, index, close (last ~10)
-
+        idx_rows = []
         for i, info in enumerate(idx_defs):
             try:
                 h = yf.download(
@@ -980,103 +972,17 @@ if run:
                     "5D % Change": round(chg_5d_idx, DP) if chg_5d_idx is not None else None,
                 })
 
-                # --- Build history for graphics: last 6 sessions up to pos_lvl
-                start_pos = max(0, pos_lvl - 5)
-                window = h.iloc[start_pos:pos_lvl+1].copy()
-                window = window.reset_index()
-                window["DateOnly"] = pd.to_datetime(window["Date"]).dt.date
-                closes = window["Close"].astype(float)
-
-                # base=100 at first point in window
-                base = closes.iloc[0]
-                base100 = (closes / base) * 100.0 if base else np.nan
-
-                for d, lv, b in zip(window["DateOnly"].tolist(), closes.tolist(), base100.tolist()):
-                    tidy_rows.append({
-                        "date": d.isoformat(),
-                        "index": info["name"],
-                        "close": round(lv, DP),
-                        "base100": round(b, DP) if pd.notnull(b) else None
-                    })
-
-                series6 = pd.Series(closes.values, index=window["DateOnly"].astype(str).values, name=info["name"])
-                date_index_for_wide = series6.index  # last one wins (same length across)
-                wide_dict[info["name"]] = series6
-
-                # --- Mini chart series (exact data shown in the charts): last ~10 sessions (Close)
-                series_chart = h["Close"].dropna().tail(10)
-                # collect even if charts are hidden, so the download has the data
-                for dt_idx, v in series_chart.items():
-                    minichart_rows.append({
-                        "date": pd.to_datetime(dt_idx).date().isoformat(),
-                        "index": info["name"],
-                        "close": round(float(v), DP)
-                    })
-
                 if show_index_charts:
+                    series = h["Close"].dropna().tail(10)
                     with chart_cols[i]:
                         st.caption(info["name"])
-                        st.line_chart(series_chart)
-
+                        st.line_chart(series)
             except Exception:
                 continue
 
         if idx_rows:
             st.subheader("Major indices — 5-day trend")
-            idx_df = pd.DataFrame(idx_rows)
-            st.dataframe(idx_df, use_container_width=True)
-
-            # 1) Summary CSV (5D % table)
-            out_sum = io.StringIO()
-            idx_df.to_csv(out_sum, index=False)
-            st.download_button(
-                "⬇️ Download indices summary (5D %).csv",
-                data=out_sum.getvalue(),
-                file_name=f"indices_5d_summary_{selected_date.isoformat()}.csv",
-                mime="text/csv"
-            )
-
-            # 2) Tidy CSV (date,index,close,base100) last 6 sessions
-            if tidy_rows:
-                tidy_df = pd.DataFrame(tidy_rows).sort_values(["index","date"])
-                out_tidy = io.StringIO()
-                tidy_df.to_csv(out_tidy, index=False)
-                st.download_button(
-                    "⬇️ Download indices (tidy, last 6 sessions).csv",
-                    data=out_tidy.getvalue(),
-                    file_name=f"indices_tidy_last6_{selected_date.isoformat()}.csv",
-                    mime="text/csv"
-                )
-
-            # 3) Wide CSV (rows=dates, cols=indices) last 6 sessions
-            if wide_dict and date_index_for_wide is not None:
-                wide_df = pd.DataFrame(index=date_index_for_wide)
-                for k, s in wide_dict.items():
-                    wide_df[k] = s.reindex(index=date_index_for_wide)
-                wide_df = wide_df.applymap(lambda x: round(float(x), DP) if pd.notnull(x) else x)
-                wide_df = wide_df.reset_index().rename(columns={"index": "date"})
-                out_wide = io.StringIO()
-                wide_df.to_csv(out_wide, index=False)
-                st.download_button(
-                    "⬇️ Download indices (wide, last 6 sessions).csv",
-                    data=out_wide.getvalue(),
-                    file_name=f"indices_wide_last6_{selected_date.isoformat()}.csv",
-                    mime="text/csv"
-                )
-
-        # 4) Mini-chart data (exact series shown in the line charts) — show even if idx_rows is empty
-        if minichart_rows:
-            mini_df = pd.DataFrame(minichart_rows).sort_values(["index","date"])
-            out_mini = io.StringIO()
-            mini_df.to_csv(out_mini, index=False)
-            st.download_button(
-                "⬇️ Download mini-chart data (last ~10 sessions, tidy).csv",
-                data=out_mini.getvalue(),
-                file_name=f"indices_minicharts_last10_{selected_date.isoformat()}.csv",
-                mime="text/csv"
-            )
-        elif show_indices:
-            st.info("No mini-chart data available for the selected date/tickers.")
+            st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
 
     # --------- Stocks table / CSV ----------
     if not rows:
