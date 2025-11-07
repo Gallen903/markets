@@ -416,7 +416,7 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     return float(df.iloc[ref_pos][_col(use_price_return)])
 
 # -----------------------------
-# Yahoo chart endpoint for exact YTD
+# Yahoo chart endpoint helpers (exact Yahoo calculations)
 # -----------------------------
 def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -432,6 +432,66 @@ def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[di
                 return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+
+def _yahoo_chart_series(symbol: str, max_range: str = "3mo", interval: str = "1d"):
+    """Return list of (date, close) with None filtered out, using Yahoo chart API."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": max_range, "interval": interval, "includePrePost": "false", "events": "div,splits"}
+    data = _http_get_json(url, params)
+    if not data:
+        return None, None
+    try:
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        tzname = meta.get("exchangeTimezoneName", "UTC")
+        tz = ZoneInfo(tzname) if ZoneInfo else None
+
+        stamps = result.get("timestamp", []) or []
+        closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
+        dcs = []
+        for t, c in zip(stamps, closes):
+            if c is None:
+                continue
+            dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
+            dcs.append((dt.date(), float(c)))
+        return dcs, meta
+    except Exception:
+        return None, None
+
+def yahoo_pct_change_n_bars(symbol: str, on_date: date, n_bars: int, use_live_when_today: bool = True) -> Optional[float]:
+    """
+    Mirror Yahoo UI by using its chart bars.
+    Numerator = last bar on/before on_date (or live if today & requested).
+    Baseline  = the bar n_bars earlier in the *chart* sequence.
+    """
+    dcs, meta = _yahoo_chart_series(symbol, max_range="3mo", interval="1d")
+    if not dcs:
+        return None
+
+    # restrict to on/before the target date
+    upto = [c for (d, c) in dcs if d <= on_date]
+    if len(upto) < (n_bars + 1):
+        return None
+
+    last_close = upto[-1]
+
+    if use_live_when_today and on_date == date.today():
+        try:
+            fi = yf.Ticker(symbol).fast_info
+            live = fi.get("last_price") or fi.get("regular_market_price")
+            if live is not None:
+                last_close = float(live)
+        except Exception:
+            pass
+
+    base = upto[-(n_bars + 1)]
+    if not base:
+        return None
+    return (last_close - base) / base * 100.0
+
+def yahoo_5d_via_chart(symbol: str, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
+    # Yahoo's 5D in UI is 5 trading bars back
+    return yahoo_pct_change_n_bars(symbol, on_date, n_bars=5, use_live_when_today=use_live_when_today)
 
 def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
     """
@@ -607,7 +667,7 @@ use_price_return = st.toggle(
 exact_yahoo_mode = st.toggle(
     "Exact Yahoo YTD (chart feed)",
     value=True,
-    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
+    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar. Also applies to 5D %."
 )
 use_manual_baselines = st.toggle(
     "Use manual YTD baselines when available",
@@ -890,10 +950,15 @@ if run:
 
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
 
-            c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
+            # ----- 5D % change -----
             chg_5d = None
-            if c_5ago is not None and c_5ago != 0:
-                chg_5d = (price_num - c_5ago) / c_5ago * 100.0
+            if exact_yahoo_mode:
+                chg_5d = yahoo_5d_via_chart(tkr, target_date, use_live_when_today=use_price_return)
+            if chg_5d is None:
+                # Fallback to local bars (could drift if Yahoo missing sessions)
+                c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
+                if c_5ago is not None and c_5ago != 0:
+                    chg_5d = (price_num - c_5ago) / c_5ago * 100.0
 
             manual_used = False
             chg_ytd = None
@@ -961,10 +1026,14 @@ if run:
                 if pos_lvl is None:
                     continue
 
-                lvl_5ago = close_n_trading_days_ago_by_pos(h, pos_lvl, 5, use_price_return=True)
+                # 5D via Yahoo chart when exact_yahoo_mode is ON; else fallback to local bars
                 chg_5d_idx = None
-                if lvl_5ago is not None and lvl_5ago != 0:
-                    chg_5d_idx = (last_lvl - lvl_5ago) / lvl_5ago * 100.0
+                if exact_yahoo_mode:
+                    chg_5d_idx = yahoo_5d_via_chart(info["ticker"], target_date, use_live_when_today=True)
+                if chg_5d_idx is None:
+                    lvl_5ago = close_n_trading_days_ago_by_pos(h, pos_lvl, 5, use_price_return=True)
+                    if lvl_5ago is not None and lvl_5ago != 0:
+                        chg_5d_idx = (last_lvl - lvl_5ago) / lvl_5ago * 100.0
 
                 idx_rows.append({
                     "Index": info["name"],
