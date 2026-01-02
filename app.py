@@ -261,7 +261,6 @@ def init_db_with_defaults():
         ("ABT","Abbott Laboratories","US","USD"),
         ("CRH","CRH plc","US","USD"),
         ("SW","Smurfit Westrock Plc","US","USD"),
-        ("DEO","Diageo","US","USD"),
         ("AER","AerCap Holdings","US","USD"),
         ("FLUT","Flutter Entertainment plc","US","USD"),
         # --- Europe (non-UK, non-Ireland) ---
