@@ -987,26 +987,8 @@ if run:
                 continue
             
             st.write(f"  ✓ SUCCESS: Have price={price_eod}, pos={pos}")
-
-
-    # --------- Stocks ----------
-    for s in selected_stocks:
-        tkr = s["ticker"]
-        try:
-            hist = yf.download(
-                tkr,
-                start=f"{selected_date.year-1}-12-15",
-                end=selected_date + timedelta(days=7),
-                progress=False,
-                auto_adjust=False,
-            )
-            if hist.empty:
-                continue
-
-            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
-            if pos is None:
-                continue
-
+            
+            # Keep the rest of the original logic here
             use_live = use_price_return and (target_date == today_date)
             live_price = None
             if use_live:
@@ -1064,7 +1046,8 @@ if run:
                 "5D % Change": round(chg_5d, DP) if chg_5d is not None else None,
                 "YTD % Change": round(chg_ytd, DP) if chg_ytd is not None else None,
             })
-        except Exception:
+        except Exception as e:
+            st.write(f"  ✗ ERROR: {type(e).__name__}: {e}")
             continue
 
     # --------- Indices ----------
