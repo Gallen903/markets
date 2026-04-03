@@ -404,7 +404,15 @@ def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_
     if not mask.any():
         return None, None
     pos = np.where(mask)[0][-1]
-    return float(df.iloc[pos][_col(use_price_return)]), pos
+    col_name = _col(use_price_return)
+    try:
+        value = df.iloc[pos][col_name]
+        # Handle both single and multi-level columns
+        if isinstance(value, pd.Series):
+            value = value.iloc[0]
+        return float(value), pos
+    except Exception:
+        return None, None
 
 def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
     if df.empty or pos is None:
@@ -412,7 +420,15 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     ref_pos = pos - n
     if ref_pos < 0:
         return None
-    return float(df.iloc[ref_pos][_col(use_price_return)])
+    col_name = _col(use_price_return)
+    try:
+        value = df.iloc[ref_pos][col_name]
+        # If it's a Series, take the first value
+        if isinstance(value, pd.Series):
+            value = value.iloc[0]
+        return float(value)
+    except Exception:
+        return None
 
 # -----------------------------
 # Yahoo chart endpoint for exact YTD + 5D (resilient fetch)
@@ -612,7 +628,12 @@ def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_
         return None
     pos = np.where(mask)[0][-1]
     try:
-        return float(hist.iloc[pos][_col(use_price_return)])
+        col_name = _col(use_price_return)
+        value = hist.iloc[pos][col_name]
+        # If it's a Series, take the first value
+        if isinstance(value, pd.Series):
+            value = value.iloc[0]
+        return float(value)
     except Exception:
         return None
 
