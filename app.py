@@ -953,6 +953,41 @@ if run:
     target_dt = pd.to_datetime(selected_date)
     target_date = target_dt.date()
     today_date = date.today()
+    
+    st.write(f"**DEBUG: target_date = {target_date}, today = {today_date}**")
+    st.write(f"**Selected {len(selected_stocks)} stocks**")
+
+    # --------- Stocks ----------
+    for s in selected_stocks:
+        tkr = s["ticker"]
+        st.write(f"\n**Processing {tkr}...**")
+        try:
+            hist = yf.download(
+                tkr,
+                start=f"{selected_date.year-1}-12-15",
+                end=selected_date + timedelta(days=7),
+                progress=False,
+                auto_adjust=False,
+            )
+            st.write(f"  yfinance returned {len(hist)} rows")
+            st.write(f"  hist type: {type(hist)}")
+            st.write(f"  hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
+            
+            if hist.empty:
+                st.write(f"  ✗ SKIP: hist is empty")
+                continue
+
+            st.write(f"  hist index dates: {[str(d.date()) for d in hist.index[-5:]]}")
+            
+            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
+            st.write(f"  last_close_on_or_before_date returned: price_eod={price_eod}, pos={pos}")
+            
+            if pos is None:
+                st.write(f"  ✗ SKIP: pos is None")
+                continue
+            
+            st.write(f"  ✓ SUCCESS: Have price={price_eod}, pos={pos}")
+
 
     # --------- Stocks ----------
     for s in selected_stocks:
