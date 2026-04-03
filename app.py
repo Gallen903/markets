@@ -983,7 +983,13 @@ if run:
         tkr = s["ticker"]
         st.write(f"\n**Processing {tkr}...**")
         try:
-            hist = yf.download(...)
+            hist = yf.download(
+                tkr,
+                start=f"{selected_date.year-1}-12-15",
+                end=selected_date + timedelta(days=7),
+                progress=False,
+                auto_adjust=False,
+            )
             st.write(f"  yfinance returned {len(hist)} rows")
             st.write(f"  hist type: {type(hist)}")
             st.write(f"  hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
@@ -1001,7 +1007,8 @@ if run:
                 st.write(f"  ✗ SKIP: pos is None")
                 continue
             
-            st.write(f"  ✓ SUCCESS: Have price={price_eod}, pos={pos}")            
+            st.write(f"  ✓ SUCCESS: Have price={price_eod}, pos={pos}")
+            
             # Keep the rest of the original logic here
             use_live = use_price_return and (target_date == today_date)
             live_price = None
