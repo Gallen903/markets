@@ -267,10 +267,10 @@ def init_db_with_defaults():
         ("HEIA.AS","Heineken N.V.","Europe","EUR"),
         ("BSN.F","Danone S.A.","Europe","EUR"),
         ("BKT.MC","Bankinter","Europe","EUR"),
-        ("IBE.MC","Iberdrola S.A.","Europe","EUR"),    # Madrid (primary)
-        ("ORSTED.CO","Orsted A/S","Europe","DKK"),     # Copenhagen (primary)
-        ("ROG.SW","Roche Holding AG","Europe","CHF"),  # SIX Swiss (primary)
-        ("SAN.PA","Sanofi","Europe","EUR"),            # Paris (primary)
+        ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
+        ("ORSTED.CO","Orsted A/S","Europe","DKK"),
+        ("ROG.SW","Roche Holding AG","Europe","CHF"),
+        ("SAN.PA","Sanofi","Europe","EUR"),
         # --- UK ---
         ("VOD.L","Vodafone Group","UK","GBp"),
         ("DCC.L","DCC plc","UK","GBp"),
@@ -389,7 +389,6 @@ def currency_symbol(cur: str) -> str:
     }.get(cur, "")
 
 def _col(use_price_return: bool) -> str:
-    # Yahoo UI uses price return => 'Close'; total return => 'Adj Close'
     return "Close" if use_price_return else "Adj Close"
 
 def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
@@ -407,7 +406,6 @@ def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_
     col_name = _col(use_price_return)
     try:
         value = df.iloc[pos][col_name]
-        # Handle both single and multi-level columns
         if isinstance(value, pd.Series):
             value = value.iloc[0]
         return float(value), pos
@@ -423,7 +421,6 @@ def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_pric
     col_name = _col(use_price_return)
     try:
         value = df.iloc[ref_pos][col_name]
-        # If it's a Series, take the first value
         if isinstance(value, pd.Series):
             value = value.iloc[0]
         return float(value)
@@ -491,16 +488,13 @@ def _yahoo_chart_series(symbol: str, max_range: str = "3mo", interval: str = "1d
     return None, None
 
 def yahoo_pct_change_n_bars(symbol: str, on_date: date, n_bars: int, use_live_when_today: bool = True) -> Optional[float]:
-    """
-    Prefer Yahoo chart bars; if we have < n_bars+1 bars up to on_date, return None.
-    """
     dcs, meta = _yahoo_chart_series(symbol, max_range="3mo", interval="1d")
     if not dcs:
         return None
 
     upto = [c for (d, c) in dcs if d <= on_date]
     if len(upto) < (n_bars + 1):
-        return None  # not enough bars -> caller will fallback
+        return None
 
     last_close = upto[-1]
     if use_live_when_today and on_date == date.today():
@@ -518,16 +512,10 @@ def yahoo_pct_change_n_bars(symbol: str, on_date: date, n_bars: int, use_live_wh
     return (last_close - base) / base * 100.0
 
 def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
-    """
-    Compute YTD % using Yahoo's own chart data (daily 'close' series).
-    Baseline: last close BEFORE Jan 1 of `year` (local to exchange).
-    Numerator: last close ON/BEFORE `on_date` (or live price if today & requested).
-    """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
     data = _http_get_json(url, params)
     if not data:
-        # try secondary host
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
         data = _http_get_json(url, params)
         if not data:
@@ -586,18 +574,18 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
 # OFFICIAL EXCHANGE CALENDAR helpers (Option B)
 # -----------------------------
 CAL_BY_SUFFIX = {
-    "IR": "XDUB",  # Dublin
-    "PA": "XPAR",  # Paris
-    "AS": "XAMS",  # Amsterdam
-    "BR": "XBRU",  # Brussels
-    "LS": "XLIS",  # Lisbon
-    "L":  "XLON",  # London
-    "MC": "XMAD",  # Madrid
-    "CO": "XCSE",  # Copenhagen
-    "SW": "XSWX",  # SIX Swiss
-    "DE": "XETR",  # Xetra
-    "F":  "XFRA",  # Frankfurt floor
-    "MI": "XMIL",  # Milan
+    "IR": "XDUB",
+    "PA": "XPAR",
+    "AS": "XAMS",
+    "BR": "XBRU",
+    "LS": "XLIS",
+    "L":  "XLON",
+    "MC": "XMAD",
+    "CO": "XCSE",
+    "SW": "XSWX",
+    "DE": "XETR",
+    "F":  "XFRA",
+    "MI": "XMIL",
 }
 def _suffix(sym: str) -> str:
     return sym.split(".")[-1].upper() if "." in sym else ""
@@ -630,7 +618,6 @@ def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_
     try:
         col_name = _col(use_price_return)
         value = hist.iloc[pos][col_name]
-        # If it's a Series, take the first value
         if isinstance(value, pd.Series):
             value = value.iloc[0]
         return float(value)
@@ -643,6 +630,20 @@ def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
 st.caption("YTD can use official exchange calendars (Europe) or Yahoo’s chart feed. Manual baselines override when provided. Data persisted to your GitHub repo.")
+
+# Debug toggle + helper
+DEBUG_MODE = st.sidebar.toggle("Show debug info", value=False)
+
+_debug_box = None
+if DEBUG_MODE:
+    _debug_box = st.sidebar.expander("Debug output", expanded=True)
+
+def debug(msg):
+    if DEBUG_MODE:
+        if _debug_box is not None:
+            _debug_box.write(msg)
+        else:
+            st.write(msg)
 
 # Always-visible GitHub Sync in the sidebar
 def _gh_config_ok():
@@ -712,7 +713,6 @@ use_official_calendars = st.toggle(
     value=True,
     help="Baseline = last official session < Jan 1 per venue (XDUB/XPAR/XAMS/XMAD/XCSE/XSWX)."
 )
-# Rounding
 round_two_dp = st.toggle(
     "Round to 2 decimal places (off = 1 dp)",
     value=False,
@@ -722,7 +722,6 @@ DP = 2 if round_two_dp else 1
 price_fmt = f"{{:.{DP}f}}"
 pct_fmt   = f"{{:.{DP}f}}"
 
-# Indices
 show_indices = st.toggle(
     "Show index 5-day trends (ISEQ, FTSE 100, S&P 500, DAX)",
     value=True
@@ -732,7 +731,6 @@ show_index_charts = st.checkbox(
     value=False
 )
 
-# ---- Init DB and seed from GitHub (if configured)
 init_db_with_defaults()
 if _gh_headers() and _gh_repo()[0]:
     seed_db_from_github()
@@ -770,7 +768,6 @@ with st.expander("🧪 Data diagnostics (Yahoo bars vs yfinance)"):
         else:
             st.warning("yfinance returned empty history for this window.")
 
-# Editor: add/remove stocks
 with st.expander("➕ Add or ➖ remove stocks (Git-backed)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
@@ -802,7 +799,6 @@ with st.expander("➕ Add or ➖ remove stocks (Git-backed)"):
 
     st.markdown("---")
     st.markdown("**Export / import stock list**")
-    # Export current stocks to CSV
     try:
         stocks_now = db_all_stocks().sort_values("name")
         out = io.StringIO()
@@ -811,7 +807,6 @@ with st.expander("➕ Add or ➖ remove stocks (Git-backed)"):
     except Exception as e:
         st.warning(f"Could not export stocks: {e}")
 
-    # Import stocks from CSV (tolerant)
     up_stocks = st.file_uploader("Upload stocks CSV", type=["csv"], key="stocks_csv")
     if up_stocks is not None:
         try:
@@ -838,12 +833,10 @@ with st.expander("➕ Add or ➖ remove stocks (Git-backed)"):
         except Exception as e:
             st.exception(e)
 
-# ---- Manual YTD baseline manager
 with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of year)"):
     cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
     st.caption("Each row defines the baseline price used for YTD % for that ticker in this year. Price should match the series you want to mirror (Yahoo typically uses Close).")
 
-    # Quick add form
     c1, c2, c3, c4 = st.columns([1.2, 0.8, 0.8, 1])
     with c1:
         b_ticker = st.text_input("Ticker (exact)", placeholder="A5G.IR")
@@ -865,7 +858,6 @@ with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of ye
         except Exception as e:
             st.error(f"Could not save baseline: {e}")
 
-    # --- CSV/Excel import/export (tolerant) ---
     st.markdown("**Bulk import / export**")
     st.caption("Accepted: CSV or Excel. Columns: ticker, year, price, date (optional), series (close|adjclose, optional), notes (optional)")
 
@@ -873,7 +865,6 @@ with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of ye
         name = upfile.name.lower()
         if name.endswith((".xlsx", ".xls")):
             return pd.read_excel(upfile)
-        # CSV path with delimiter sniffing + BOM handling
         upfile.seek(0)
         raw = upfile.read()
         text = raw.decode("utf-8-sig", errors="ignore")
@@ -940,7 +931,6 @@ with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of ye
         refs_df.to_csv(out_csv, index=False)
         st.download_button("⬇️ Download current year's baselines CSV", data=out_csv.getvalue(), file_name=f"ytd_baselines_{cur_year}.csv", mime="text/csv")
 
-    # Delete selected
     if not refs_df.empty:
         del_opts = [f"{r['ticker']} ({r['year']})" for _, r in refs_df.iterrows()]
         del_sel = st.multiselect("Delete baselines", del_opts, [])
@@ -956,7 +946,6 @@ with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of ye
             st.info(f"↩︎ {msg}") if ok else st.warning(msg)
             st.rerun()
 
-# Stock selection for this run
 stocks_df = db_all_stocks()
 stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
 sel_labels = st.multiselect(
@@ -975,13 +964,13 @@ if run:
     target_date = target_dt.date()
     today_date = date.today()
     
-    st.write(f"**DEBUG: target_date = {target_date}, today = {today_date}**")
-    st.write(f"**Selected {len(selected_stocks)} stocks**")
+    debug(f"**DEBUG: target_date = {target_date}, today = {today_date}**")
+    debug(f"**Selected {len(selected_stocks)} stocks**")
 
     # --------- Stocks ----------
     for s in selected_stocks:
         tkr = s["ticker"]
-        st.write(f"\n**Processing {tkr}...**")
+        debug(f"**Processing {tkr}...**")
         try:
             hist = yf.download(
                 tkr,
@@ -990,26 +979,25 @@ if run:
                 progress=False,
                 auto_adjust=False,
             )
-            st.write(f"  yfinance returned {len(hist)} rows")
-            st.write(f"  hist type: {type(hist)}")
-            st.write(f"  hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
+            debug(f"yfinance returned {len(hist)} rows")
+            debug(f"hist type: {type(hist)}")
+            debug(f"hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
             
             if hist.empty:
-                st.write(f"  ✗ SKIP: hist is empty")
+                debug("✗ SKIP: hist is empty")
                 continue
 
-            st.write(f"  hist index dates: {[str(d.date()) for d in hist.index[-5:]]}")
+            debug(f"hist index dates: {[str(d.date()) for d in hist.index[-5:]]}")
             
             price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
-            st.write(f"  last_close_on_or_before_date returned: price_eod={price_eod}, pos={pos}")
+            debug(f"last_close_on_or_before_date returned: price_eod={price_eod}, pos={pos}")
             
             if pos is None:
-                st.write(f"  ✗ SKIP: pos is None")
+                debug("✗ SKIP: pos is None")
                 continue
             
-            st.write(f"  ✓ SUCCESS: Have price={price_eod}, pos={pos}")
+            debug(f"✓ SUCCESS: Have price={price_eod}, pos={pos}")
             
-            # Keep the rest of the original logic here
             use_live = use_price_return and (target_date == today_date)
             live_price = None
             if use_live:
@@ -1021,7 +1009,6 @@ if run:
 
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
 
-            # 5D change: Prefer Yahoo bars; fallback to yfinance window if unavailable
             chg_5d = None
             if exact_yahoo_mode:
                 chg_5d = yahoo_pct_change_n_bars(tkr, target_date, 5, use_live_when_today=use_price_return)
@@ -1033,20 +1020,17 @@ if run:
             manual_used = False
             chg_ytd = None
 
-            # Manual baseline
             manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
             if manual_ref is not None:
                 base = float(manual_ref["price"])
                 chg_ytd = (price_num - base) / base * 100.0
                 manual_used = True
             else:
-                # Official exchange calendars
                 base_val = None
                 if use_official_calendars and _HAS_XCALS:
                     baseline_session = official_prev_year_last_session(tkr, selected_date.year)
                     if baseline_session is not None:
                         base_val = baseline_from_hist_on_or_before(hist, baseline_session, use_price_return)
-                # Yahoo chart or fallback
                 if base_val is not None and base_val != 0:
                     chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
                 else:
@@ -1068,7 +1052,7 @@ if run:
                 "YTD % Change": round(chg_ytd, DP) if chg_ytd is not None else None,
             })
         except Exception as e:
-            st.write(f"  ✗ ERROR: {type(e).__name__}: {e}")
+            debug(f"✗ ERROR: {type(e).__name__}: {e}")
             continue
 
     # --------- Indices ----------
@@ -1097,7 +1081,6 @@ if run:
                 if pos_lvl is None:
                     continue
 
-                # 5D index change: Yahoo bars first, else fallback
                 chg_5d_idx = None
                 if exact_yahoo_mode:
                     chg_5d_idx = yahoo_pct_change_n_bars(info["ticker"], target_date, 5, use_live_when_today=True)
@@ -1150,7 +1133,6 @@ if run:
             st.subheader(header)
             st.dataframe(g[display_cols], use_container_width=True)
 
-        # CSV export
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
             "UK":      f"UK ({currency_symbol('GBp')})",
