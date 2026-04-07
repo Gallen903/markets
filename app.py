@@ -384,23 +384,9 @@ def currency_symbol(cur: str) -> str:
         "USD": "$",
         "EUR": "€",
         "GBp": "£",
-        "GBP": "£",
         "DKK": "kr",
         "CHF": "Fr",
     }.get(cur, "")
-
-def display_price_and_currency(price: Optional[float], cur: str):
-    """
-    Convert raw provider price to display units.
-    Yahoo/LSE prices often come through in GBp (pence), but we want to show £.
-    """
-    if price is None:
-        return None, cur
-
-    if cur == "GBp":
-        return float(price) / 100.0, "GBP"
-
-    return float(price), cur
 
 def _col(use_price_return: bool) -> str:
     return "Close" if use_price_return else "Adj Close"
@@ -1056,14 +1042,12 @@ if run:
                         base_fallback = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
                         chg_ytd = ((price_num - base_fallback) / base_fallback * 100.0) if base_fallback else None
 
-            display_price, display_currency = display_price_and_currency(price_num, s["currency"])
-
             rows.append({
                 "Company": s["name"],
                 "Manual": "🧭" if manual_used else "",
                 "Region": s["region"],
-                "Currency": display_currency,
-                "Price": round(display_price, DP) if display_price is not None else None,
+                "Currency": s["currency"],
+                "Price": round(price_num, DP),
                 "5D % Change": round(chg_5d, DP) if chg_5d is not None else None,
                 "YTD % Change": round(chg_ytd, DP) if chg_ytd is not None else None,
             })
@@ -1151,7 +1135,7 @@ if run:
 
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
-            "UK":      f"UK ({currency_symbol('GBP')})",
+            "UK":      f"UK ({currency_symbol('GBp')})",
             "Europe":  f"Europe ({currency_symbol('EUR')})",
             "US":      f"US ({currency_symbol('USD')})",
         }
