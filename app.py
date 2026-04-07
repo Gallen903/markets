@@ -1135,7 +1135,7 @@ if run:
 
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
-            "UK":      f"UK ({currency_symbol('GBp')})",
+            "UK":      f"UK (GBX)",
             "Europe":  f"Europe ({currency_symbol('EUR')})",
             "US":      f"US ({currency_symbol('USD')})",
         }
@@ -1147,7 +1147,7 @@ if run:
             g = df[df["Region"] == region]
             if g.empty:
                 continue
-            writer.writerow([REGION_LABELS[region], "Last price", "5D %change", "YTD % change"])
+            writer.writerow([REGION_LABELS[region], "Last price", "5D % change", "YTD % change"])
             for _, row in g.iterrows():
                 company = (row["Company"] or "").replace(",", "")
                 price = (price_fmt.format(row['Price'])) if pd.notnull(row["Price"]) else ""
