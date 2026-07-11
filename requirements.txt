@@ -1,4 +1,6 @@
-streamlit
-yfinance
-pandas
-exchange_calendars>=4.5.2
+streamlit==1.46.1
+pandas==2.3.0
+numpy==2.2.6
+yfinance==0.2.65
+exchange-calendars==4.7
+requests==2.32.4
