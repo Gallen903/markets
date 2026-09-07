@@ -10,6 +10,7 @@ import csv
 import os
 import base64
 import json
+import re
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
@@ -19,6 +20,13 @@ try:
 except Exception:
     import urllib.request, urllib.parse
     _HTTP_LIB = "urllib"
+
+# Optional HTML parser for the Euronext fallback. The fallback also has a regex parser,
+# so the app does not require BeautifulSoup to keep working.
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 
 # --- Timezone helper (ZoneInfo on Python 3.9+) ---
 try:
@@ -572,6 +580,180 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
         return None
 
 # -----------------------------
+# Price-source fallback: Euronext Dublin
+# -----------------------------
+# Yahoo remains the primary source. If Yahoo returns no history for an Irish
+# .IR ticker, we make a best-effort request to Euronext's public quote page.
+# This fallback is deliberately conservative: it will only supply a CURRENT
+# price for today's run. It will never invent historical prices for an older
+# selected date. Euronext's official Web Services also supports historical
+# data, but access/configuration depends on the user's market-data agreement.
+EURONEXT_FALLBACK_ENABLED = True
+
+
+def _euronext_quote_html(url: str, timeout: float = 12.0) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": "https://live.euronext.com/en/markets/dublin",
+    }
+    try:
+        if _HTTP_LIB == "requests":
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _parse_euronext_price(html: str) -> Optional[float]:
+    """Extract the current Euronext quote from the public detailed-quote HTML."""
+    if not html:
+        return None
+
+    # Preferred selector used by the current Euronext page.
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            node = soup.select_one("#header-instrument-price")
+            if node:
+                text = node.get_text(" ", strip=True)
+                # Keep digits, decimal separators and minus sign; Euronext can
+                # format prices with either comma or dot depending on locale.
+                m = re.search(r"[-+]?\d[\d\\s.,]*", text)
+                if m:
+                    raw = m.group(0).replace(" ", "")
+                    if raw.count(",") == 1 and raw.count(".") == 0:
+                        raw = raw.replace(",", ".")
+                    elif raw.count(",") > 0 and raw.count(".") > 0:
+                        # Assume the final separator is the decimal separator.
+                        if raw.rfind(",") > raw.rfind("."):
+                            raw = raw.replace(".", "").replace(",", ".")
+                        else:
+                            raw = raw.replace(",", "")
+                    return float(raw)
+        except Exception:
+            pass
+
+    # Regex fallback if BeautifulSoup is not installed.
+    try:
+        m = re.search(
+            r'id=["\']header-instrument-price["\'][^>]*>(.*?)</',
+            html,
+            flags=re.I | re.S,
+        )
+        if m:
+            text = re.sub(r"<[^>]+>", " ", m.group(1))
+            text = re.sub(r"\s+", " ", text).strip()
+            m2 = re.search(r"[-+]?\d[\d\s.,]*", text)
+            if m2:
+                raw = m2.group(0).replace(" ", "")
+                if raw.count(",") == 1 and raw.count(".") == 0:
+                    raw = raw.replace(",", ".")
+                return float(raw)
+    except Exception:
+        pass
+    return None
+
+
+def _euronext_find_instrument_url(ticker: str) -> Optional[str]:
+    """Find an Euronext Dublin equity URL for a ticker when possible.
+
+    The search page is used instead of hard-coding ISINs. This means new
+    securities can work without adding another mapping to the application.
+    """
+    base = "https://live.euronext.com/en/search_instruments/"
+    variants = [ticker, ticker.upper(), ticker.replace(".IR", "")]
+    for q in variants:
+        try:
+            if _HTTP_LIB == "requests":
+                r = requests.get(
+                    base,
+                    params={"query": q},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=12,
+                )
+                r.raise_for_status()
+                html = r.text
+            else:
+                url = base + "?" + urllib.parse.urlencode({"query": q})
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+
+            # Only accept Dublin equity instrument links. We deliberately do
+            # not accept another Euronext venue just because the ticker matches.
+            matches = re.findall(
+                r'href=["\']([^"\']*/product/equities/[^"\']+-XDUB)["\']',
+                html,
+                flags=re.I,
+            )
+            if matches:
+                # De-duplicate while preserving order.
+                seen = set()
+                for u in matches:
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    return "https://live.euronext.com" + u if u.startswith("/") else u
+        except Exception:
+            continue
+    return None
+
+
+def euronext_current_price(ticker: str) -> Optional[float]:
+    """Return today's Euronext Dublin price, or None if it cannot be resolved."""
+    if not EURONEXT_FALLBACK_ENABLED or not ticker.upper().endswith(".IR"):
+        return None
+
+    instrument_url = _euronext_find_instrument_url(ticker)
+    if not instrument_url:
+        return None
+
+    # The public detailed-quote endpoint is the same source used by the
+    # Euronext Live pages. It accepts an ISIN-MIC instrument identifier.
+    identifier = instrument_url.rstrip("/").split("/product/equities/")[-1]
+    quote_url = f"https://live.euronext.com/en/ajax/getDetailedQuote/{identifier}"
+    html = _euronext_quote_html(quote_url)
+    price = _parse_euronext_price(html) if html else None
+    return price
+
+
+def download_history_with_fallback(ticker: str, start, end, target_date: Optional[date] = None):
+    """Primary Yahoo history with a conservative Euronext current-price fallback.
+
+    Returns (DataFrame, source). The returned DataFrame has the same Close/
+    Adj Close columns expected by the rest of the application.
+    """
+    hist = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
+    )
+    if hist is not None and not hist.empty:
+        return hist, "Yahoo/yfinance"
+
+    # Only use Euronext for an Irish ticker and only for a current-date run.
+    # Historical backfills must not be fabricated from today's quote.
+    if ticker.upper().endswith(".IR") and (target_date is None or target_date == date.today()):
+        px = euronext_current_price(ticker)
+        if px is not None:
+            idx = pd.DatetimeIndex([pd.Timestamp(date.today())])
+            fallback = pd.DataFrame(
+                {"Open": [px], "High": [px], "Low": [px], "Close": [px], "Adj Close": [px], "Volume": [np.nan]},
+                index=idx,
+            )
+            return fallback, "Euronext Live fallback"
+
+    return hist, None
+
+# -----------------------------
 # OFFICIAL EXCHANGE CALENDAR helpers (Option B)
 # -----------------------------
 CAL_BY_SUFFIX = {
@@ -630,7 +812,7 @@ def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("YTD can use official exchange calendars (Europe) or Yahoo’s chart feed. Manual baselines override when provided. Data persisted to your GitHub repo.")
+st.caption("Yahoo/yfinance remains the primary price source. Irish .IR tickers now have a conservative Euronext Live fallback when Yahoo returns no history. YTD can use official exchange calendars (Europe) or Yahoo’s chart feed. Manual baselines override when provided. Data persisted to your GitHub repo.")
 
 # Debug toggle + helper
 DEBUG_MODE = st.sidebar.toggle("Show debug info", value=False)
@@ -762,6 +944,10 @@ with st.expander("🧪 Data diagnostics (Yahoo bars vs yfinance)"):
             st.write("Yahoo 5D % (if available):", yahoo_pct_change_n_bars(tkr_test, dt_test, 5, use_live_when_today=True))
         else:
             st.warning("No chart bars returned from Yahoo (after retries).")
+
+        if tkr_test.upper().endswith(".IR"):
+            ep = euronext_current_price(tkr_test)
+            st.write("Euronext current-price fallback:", ep if ep is not None else "No quote returned")
 
         h_diag = yf.download(tkr_test, start=dt_test - timedelta(days=20), end=dt_test + timedelta(days=2), progress=False, auto_adjust=False)
         if not h_diag.empty:
@@ -973,19 +1159,19 @@ if run:
         tkr = s["ticker"]
         debug(f"**Processing {tkr}...**")
         try:
-            hist = yf.download(
+            hist, price_source = download_history_with_fallback(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
                 end=selected_date + timedelta(days=7),
-                progress=False,
-                auto_adjust=False,
+                target_date=target_date,
             )
-            debug(f"yfinance returned {len(hist)} rows")
+            debug(f"price source: {price_source or 'none'}")
+            debug(f"yfinance/Euronext returned {len(hist) if hist is not None else 0} rows")
             debug(f"hist type: {type(hist)}")
             debug(f"hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
             
-            if hist.empty:
-                debug("✗ SKIP: hist is empty")
+            if hist is None or hist.empty:
+                debug("✗ SKIP: no price data from Yahoo or Euronext fallback")
                 continue
 
             debug(f"hist index dates: {[str(d.date()) for d in hist.index[-5:]]}")
@@ -1007,8 +1193,11 @@ if run:
                     live_price = fi.get("last_price") or fi.get("regular_market_price")
                 except Exception:
                     live_price = None
+                if live_price is None and price_source == "Euronext Live fallback":
+                    live_price = euronext_current_price(tkr)
 
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
+            debug(f"✓ SUCCESS: Have price={price_num}, pos={pos}, source={price_source}")
 
             chg_5d = None
             if exact_yahoo_mode:
