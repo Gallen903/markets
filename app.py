@@ -1,1371 +1,1379 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import datetime, timedelta, date
-import sqlite3
-import io
-import csv
-import os
-import base64
-import json
-import re
-from typing import Optional
-
-# --- HTTP (requests preferred; fallback to stdlib urllib) ---
-try:
-    import requests
-    _HTTP_LIB = "requests"
-except Exception:
-    import urllib.request, urllib.parse
-    _HTTP_LIB = "urllib"
-
-# Optional HTML parser for the Euronext fallback. The fallback also has a regex parser,
-# so the app does not require BeautifulSoup to keep working.
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-# --- Timezone helper (ZoneInfo on Python 3.9+) ---
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # fallback to UTC if not available
-
-# --- Exchange calendars (optional) ---
-try:
-    import exchange_calendars as xcals
-    _HAS_XCALS = True
-except Exception:
-    xcals = None
-    _HAS_XCALS = False
-
-DB_PATH = "stocks.db"
-
-# =============================
-# GitHub-backed storage (CSV in repo)
-# =============================
-GH_STOCKS_PATH = "data/stocks.csv"
-GH_BASELINES_PATH = "data/reference_prices.csv"
-
-# --- Auth headers (supports classic 'token' and fine-grained 'Bearer') ---
-def _gh_headers_auth(scheme: str = "token"):
-    tok = st.secrets.get("GITHUB_TOKEN")
-    if not tok:
-        return None
-    auth = f"{'Bearer' if scheme.lower()=='bearer' else 'token'} {tok}"
-    return {
-        "Authorization": auth,
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "streamlit-app",
-        "Content-Type": "application/json",
-    }
-
-def _gh_headers():  # keep old name for callers
-    return _gh_headers_auth("token")
-
-def _gh_repo():
-    repo = st.secrets.get("GITHUB_REPO")
-    branch = st.secrets.get("GITHUB_BRANCH", "main")
-    return repo, branch
-
-def gh_get_file(path: str):
-    repo, branch = _gh_repo()
-    if not repo:
-        return None
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    for scheme in ("token", "bearer"):
-        headers = _gh_headers_auth(scheme)
-        if not headers:
-            return None
-        try:
-            if _HTTP_LIB == "requests":
-                r = requests.get(url, params={"ref": branch}, headers=headers, timeout=20)
-                if r.status_code == 200:
-                    return r.json()
-                if r.status_code == 401:
-                    continue  # try next scheme
-                return None
-            else:
-                full = f"{url}?{urllib.parse.urlencode({'ref': branch})}"
-                req = urllib.request.Request(full, headers=headers)
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            if scheme == "bearer":
-                return None
-            continue
-    return None
-
-def gh_put_file(path: str, content_bytes: bytes, message: str, sha: Optional[str]):
-    repo, branch = _gh_repo()
-    if not repo:
-        return False, "GitHub not configured"
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    payload = {
-        "message": message,
-        "content": base64.b64encode(content_bytes).decode("ascii"),
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-    body = json.dumps(payload).encode("utf-8")
-
-    for scheme in ("token", "bearer"):
-        headers = _gh_headers_auth(scheme)
-        try:
-            if _HTTP_LIB == "requests":
-                r = requests.put(url, headers=headers, json=payload, timeout=30)
-                if r.status_code in (200, 201):
-                    return True, "Committed"
-                if r.status_code == 401:
-                    continue  # try alternate scheme
-                return False, f"{r.status_code}: {r.text[:200]}"
-            else:
-                req = urllib.request.Request(url, data=body, headers=headers, method="PUT")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    code = resp.getcode()
-                    if code in (200, 201):
-                        return True, "Committed"
-                    return False, f"{code}: {resp.read(200)}"
-        except Exception as e:
-            if scheme == "bearer":
-                return False, f"Commit failed: {e}"
-            continue
-    return False, "401: Bad credentials (check token scope/SSO/repo access)"
-
-def seed_db_from_github():
-    """Fetch CSVs from repo and upsert into local SQLite tables."""
-    # stocks.csv
-    meta = gh_get_file(GH_STOCKS_PATH)
-    if meta and "content" in meta:
-        try:
-            csv_bytes = base64.b64decode(meta["content"])
-            df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", keep_default_na=False)
-            for _, r in df.iterrows():
-                t = str(r.get("ticker","")).strip()
-                n = str(r.get("name","")).strip()
-                rg = str(r.get("region","")).strip()
-                cu = str(r.get("currency","")).strip()
-                if t and n and rg and cu:
-                    db_add_stock(t, n, rg, cu)
-        except Exception:
-            pass
-
-    # reference_prices.csv
-    meta = gh_get_file(GH_BASELINES_PATH)
-    if meta and "content" in meta:
-        try:
-            csv_bytes = base64.b64decode(meta["content"])
-            df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", keep_default_na=False)
-            cols = {c.strip().lower(): c for c in df.columns}
-            req = {"ticker","year","price"}
-            if req.issubset(set(cols.keys())):
-                for _, r in df.iterrows():
-                    try:
-                        db_set_reference(
-                            str(r[cols["ticker"]]).strip(),
-                            int(pd.to_numeric(r[cols["year"]], errors="coerce")),
-                            float(pd.to_numeric(r[cols["price"]], errors="coerce")),
-                            None if "date" not in cols else (None if pd.isna(r[cols["date"]]) else str(r[cols["date"]])),
-                            None if "series" not in cols else (None if pd.isna(r[cols["series"]]) else str(r[cols["series"]])),
-                            None if "notes" not in cols else (None if pd.isna(r[cols["notes"]]) else str(r[cols["notes"]]))
-                        )
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-def sync_db_to_github(note: str = ""):
-    """Dump both tables to CSV and commit to repo."""
-    if not _gh_repo()[0] or not _gh_headers():
-        return False, "GitHub not configured"
-
-    # Stocks
-    try:
-        stocks_now = db_all_stocks().sort_values("name")
-        s_buf = io.StringIO()
-        stocks_now.to_csv(s_buf, index=False)
-        s_bytes = s_buf.getvalue().encode("utf-8")
-        meta_s = gh_get_file(GH_STOCKS_PATH)
-        sha_s = meta_s.get("sha") if meta_s else None
-        ok1, msg1 = gh_put_file(GH_STOCKS_PATH, s_bytes, f"stocks: {note or 'sync'}", sha_s)
-    except Exception as e:
-        ok1, msg1 = False, f"stocks export failed: {e}"
-
-    # Baselines
-    try:
-        refs_all = db_all_references(None)
-        r_buf = io.StringIO()
-        refs_all.to_csv(r_buf, index=False)
-        r_bytes = r_buf.getvalue().encode("utf-8")
-        meta_r = gh_get_file(GH_BASELINES_PATH)
-        sha_r = meta_r.get("sha") if meta_r else None
-        ok2, msg2 = gh_put_file(GH_BASELINES_PATH, r_bytes, f"baselines: {note or 'sync'}", sha_r)
-    except Exception as e:
-        ok2, msg2 = False, f"baselines export failed: {e}"
-
-    return (ok1 and ok2), f"stocks={msg1}; baselines={msg2}"
-
-# =============================
-# SQLite helpers (local runtime DB)
-# =============================
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_db_with_defaults():
-    conn = get_conn()
-    cur = conn.cursor()
-    # Stocks table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS stocks (
-            ticker TEXT PRIMARY KEY,
-            name   TEXT NOT NULL,
-            region TEXT NOT NULL,   -- Ireland | UK | Europe | US
-            currency TEXT NOT NULL  -- EUR | GBp | USD | DKK | CHF
-        )
-    """)
-    # Manual YTD baselines (one per ticker+year)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reference_prices (
-            ticker TEXT NOT NULL,
-            year   INTEGER NOT NULL,
-            price  REAL NOT NULL,
-            date   TEXT,
-            series TEXT,
-            notes  TEXT,
-            PRIMARY KEY (ticker, year)
-        )
-    """)
-
-    # Seed defaults WITHOUT overwriting user entries
-    defaults = [
-        # --- US ---
-        ("STT","State Street Corporation","US","USD"),
-        ("PFE","Pfizer Inc.","US","USD"),
-        ("SBUX","Starbucks Corporation","US","USD"),
-        ("PEP","PepsiCo, Inc.","US","USD"),
-        ("ORCL","Oracle Corporation","US","USD"),
-        ("NVS","Novartis AG","US","USD"),
-        ("META","Meta Platforms, Inc.","US","USD"),
-        ("MSFT","Microsoft Corporation","US","USD"),
-        ("MRK","Merck & Co., Inc.","US","USD"),
-        ("JNJ","Johnson & Johnson","US","USD"),
-        ("INTC","Intel Corporation","US","USD"),
-        ("ICON","Icon Energy Corp.","US","USD"),
-        ("HPQ","HP Inc.","US","USD"),
-        ("GE","GE Aerospace","US","USD"),
-        ("LLY","Eli Lilly and Company","US","USD"),
-        ("EBAY","eBay Inc.","US","USD"),
-        ("COKE","Coca-Cola Consolidated, Inc.","US","USD"),
-        ("BSX","Boston Scientific Corporation","US","USD"),
-        ("AAPL","Apple Inc.","US","USD"),
-        ("AMGN","Amgen Inc.","US","USD"),
-        ("ADI","Analog Devices, Inc.","US","USD"),
-        ("ABBV","AbbVie Inc.","US","USD"),
-        ("GOOG","Alphabet Inc.","US","USD"),
-        ("ABT","Abbott Laboratories","US","USD"),
-        ("CRH","CRH plc","US","USD"),
-        ("SW","Smurfit Westrock Plc","US","USD"),
-        ("AER","AerCap Holdings","US","USD"),
-        ("FLUT","Flutter Entertainment plc","US","USD"),
-        # --- Europe (non-UK, non-Ireland) ---
-        ("HEIA.AS","Heineken N.V.","Europe","EUR"),
-        ("BSN.F","Danone S.A.","Europe","EUR"),
-        ("BKT.MC","Bankinter","Europe","EUR"),
-        ("IBE.MC","Iberdrola S.A.","Europe","EUR"),
-        ("ORSTED.CO","Orsted A/S","Europe","DKK"),
-        ("ROG.SW","Roche Holding AG","Europe","CHF"),
-        ("SAN.PA","Sanofi","Europe","EUR"),
-        # --- UK ---
-        ("VOD.L","Vodafone Group","UK","GBp"),
-        ("DCC.L","DCC plc","UK","GBp"),
-        ("DGE.L","Diageo plc","UK","GBp"),
-        ("GNC.L","Greencore Group plc","UK","GBp"),
-        ("GFTU.L","Grafton Group plc","UK","GBp"),
-        ("HVO.L","hVIVO plc","UK","GBp"),
-        ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-        ("TSCO.L","Tesco plc","UK","GBp"),
-        ("BRBY.L","Burberry","UK","GBp"),
-        ("SSPG.L","SSP Group","UK","GBp"),
-        ("ABF.L","Associated British Foods","UK","GBp"),
-        ("GWMO.L","Great Western Mining Corp","UK","GBp"),
-        # --- Ireland ---
-        ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
-        ("UPR.IR","Uniphar plc","Ireland","EUR"),
-        ("RYA.IR","Ryanair Holdings plc","Ireland","EUR"),
-        ("PTSB.IR","Permanent TSB Group Holdings plc","Ireland","EUR"),
-        ("OIZ.IR","Origin Enterprises plc","Ireland","EUR"),
-        ("MLC.IR","Malin Corporation plc","Ireland","EUR"),
-        ("KRX.IR","Kingspan Group plc","Ireland","EUR"),
-        ("KRZ.IR","Kerry Group plc","Ireland","EUR"),
-        ("KMR.IR","Kenmare Resources plc","Ireland","EUR"),
-        ("IRES.IR","Irish Residential Properties REIT Plc","Ireland","EUR"),
-        ("IR5B.IR","Irish Continental Group plc","Ireland","EUR"),
-        ("HSW.IR","Hostelworld Group plc","Ireland","EUR"),
-        ("GRP.IR","Greencoat Renewables","Ireland","EUR"),
-        ("GL9.IR","Glanbia plc","Ireland","EUR"),
-        ("EG7.IR","FBD Holdings plc","Ireland","EUR"),
-        ("DQ7A.IR","Donegal Investment Group plc","Ireland","EUR"),
-        ("DHG.IR","Dalata Hotel Group plc","Ireland","EUR"),
-        ("C5H.IR","Cairn Homes plc","Ireland","EUR"),
-        ("A5G.IR","AIB Group plc","Ireland","EUR"),
-        ("BIRG.IR","Bank of Ireland Group plc","Ireland","EUR"),
-        ("YZA.IR","Arytza","Ireland","EUR"),
-    ]
-    cur.executemany(
-        "INSERT OR IGNORE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
-        defaults
-    )
-    conn.commit()
-    conn.close()
-
-def db_all_stocks():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT ticker,name,region,currency FROM stocks", conn)
-    conn.close()
-    return df
-
-def db_add_stock(ticker, name, region, currency):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO stocks (ticker,name,region,currency) VALUES (?,?,?,?)",
-                (ticker.strip(), name.strip(), region, currency))
-    conn.commit()
-    conn.close()
-
-def db_remove_stocks(tickers):
-    if not tickers:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.executemany("DELETE FROM stocks WHERE ticker = ?", [(t,) for t in tickers])
-    conn.commit()
-    conn.close()
-
-# ---- reference_prices helpers ----
-def db_set_reference(ticker: str, year: int, price: float, date_iso: Optional[str], series: Optional[str], notes: Optional[str]):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO reference_prices (ticker,year,price,date,series,notes)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(ticker,year) DO UPDATE SET price=excluded.price,date=excluded.date,series=excluded.series,notes=excluded.notes
-    """, (ticker.strip(), int(year), float(price), (date_iso or None), (series or None), (notes or None)))
-    conn.commit()
-    conn.close()
-
-def db_get_reference(ticker: str, year: int) -> Optional[dict]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT price,date,series,notes FROM reference_prices WHERE ticker=? AND year=?", (ticker.strip(), int(year)))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"price": float(row[0]), "date": row[1], "series": row[2], "notes": row[3]}
-
-def db_all_references(year: Optional[int] = None) -> pd.DataFrame:
-    conn = get_conn()
-    if year is None:
-        df = pd.read_sql_query("SELECT ticker,year,price,date,series,notes FROM reference_prices", conn)
-    else:
-        df = pd.read_sql_query("SELECT ticker,year,price,date,series,notes FROM reference_prices WHERE year = ?", conn, params=(int(year),))
-    conn.close()
-    return df
-
-def db_delete_references(keys):
-    if not keys:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.executemany("DELETE FROM reference_prices WHERE ticker=? AND year=?", keys)
-    conn.commit()
-    conn.close()
-
-# -----------------------------
-# Helpers for prices/returns
-# -----------------------------
-def currency_symbol(cur: str) -> str:
-    return {
-        "USD": "$",
-        "EUR": "€",
-        "GBp": "£",
-        "DKK": "kr",
-        "CHF": "Fr",
-    }.get(cur, "")
-
-def _col(use_price_return: bool) -> str:
-    return "Close" if use_price_return else "Adj Close"
-
-def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
-    idx = pd.to_datetime(df.index)
-    return np.array([d.date() for d in idx], dtype=object)
-
-def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
-    if df.empty:
-        return None, None
-    dates = _session_dates_index(df)
-    mask = dates <= target_date
-    if not mask.any():
-        return None, None
-    pos = np.where(mask)[0][-1]
-    col_name = _col(use_price_return)
-    try:
-        value = df.iloc[pos][col_name]
-        if isinstance(value, pd.Series):
-            value = value.iloc[0]
-        return float(value), pos
-    except Exception:
-        return None, None
-
-def close_n_trading_days_ago_by_pos(df: pd.DataFrame, pos: int, n: int, use_price_return: bool):
-    if df.empty or pos is None:
-        return None
-    ref_pos = pos - n
-    if ref_pos < 0:
-        return None
-    col_name = _col(use_price_return)
-    try:
-        value = df.iloc[ref_pos][col_name]
-        if isinstance(value, pd.Series):
-            value = value.iloc[0]
-        return float(value)
-    except Exception:
-        return None
-
-# -----------------------------
-# Yahoo chart endpoint for exact YTD + 5D (resilient fetch)
-# -----------------------------
-def _http_get_json(url: str, params: dict, timeout: float = 10.0) -> Optional[dict]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        if _HTTP_LIB == "requests":
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        else:
-            full = f"{url}?{urllib.parse.urlencode(params)}"
-            req = urllib.request.Request(full, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-
-def _yahoo_chart_series(symbol: str, max_range: str = "3mo", interval: str = "1d"):
-    """
-    Return list of (date, close) using Yahoo chart API.
-    Tries query1 then query2, and expands range if needed.
-    """
-    def _fetch(base_host: str, rng: str):
-        url = f"https://{base_host}/v8/finance/chart/{symbol}"
-        params = {
-            "range": rng,
-            "interval": interval,
-            "includePrePost": "false",
-            "events": "div,splits"
-        }
-        return _http_get_json(url, params)
-
-    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
-    ranges = [max_range, "6mo"] if max_range != "6mo" else [max_range]
-
-    for rng in ranges:
-        for host in hosts:
-            data = _fetch(host, rng)
-            if data and data.get("chart", {}).get("error") is None:
-                try:
-                    result = data["chart"]["result"][0]
-                    meta = result.get("meta", {})
-                    tzname = meta.get("exchangeTimezoneName", "UTC")
-                    tz = ZoneInfo(tzname) if ZoneInfo else None
-
-                    stamps = result.get("timestamp", []) or []
-                    closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
-                    dcs = []
-                    for t, c in zip(stamps, closes):
-                        if c is None:
-                            continue
-                        dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
-                        dcs.append((dt.date(), float(c)))
-                    if dcs:
-                        return dcs, meta
-                except Exception:
-                    pass
-    return None, None
-
-def close_to_close_pct_change_n_trading_sessions(df: pd.DataFrame, target_date: date, n: int = 5, use_price_return: bool = True) -> Optional[float]:
-    """Return n-session change from daily closes only (never live quotes)."""
-    if df is None or df.empty or n < 1:
-        return None
-    dates = _session_dates_index(df)
-    valid = np.where(dates <= target_date)[0]
-    if len(valid) < n + 1:
-        return None
-    pos = int(valid[-1])
-    base_pos = pos - n
-    col = _col(use_price_return)
-    try:
-        current = df.iloc[pos][col]
-        base = df.iloc[base_pos][col]
-        if isinstance(current, pd.Series): current = current.iloc[0]
-        if isinstance(base, pd.Series): base = base.iloc[0]
-        current, base = float(current), float(base)
-    except Exception:
-        return None
-    if not np.isfinite(current) or not np.isfinite(base) or base == 0:
-        return None
-    return (current - base) / base * 100.0
-
-def yahoo_close_to_close_pct_change_n_trading_sessions(
-    symbol: str,
-    target_date: date,
-    n: int = 5,
-) -> Optional[float]:
-    """Calculate an n-session close-to-close return from Yahoo's chart feed."""
-    try:
-        dcs, _meta = _yahoo_chart_series(symbol, max_range="3mo", interval="1d")
-        if not dcs:
-            return None
-        sessions = [(d, c) for d, c in dcs if d <= target_date and np.isfinite(c)]
-        if len(sessions) < n + 1:
-            return None
-        _current_date, current = sessions[-1]
-        _base_date, base = sessions[-(n + 1)]
-        if base == 0:
-            return None
-        return (float(current) - float(base)) / float(base) * 100.0
-    except Exception:
-        return None
-
-def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
-    data = _http_get_json(url, params)
-    if not data:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-        data = _http_get_json(url, params)
-        if not data:
-            return None
-    try:
-        result = data["chart"]["result"][0]
-        meta = result.get("meta", {})
-        tzname = meta.get("exchangeTimezoneName", "UTC")
-        tz = ZoneInfo(tzname) if ZoneInfo else None
-
-        stamps = result.get("timestamp", []) or []
-        closes = (result.get("indicators", {}).get("quote", [{}])[0].get("close", []) or [])
-        if not stamps or not closes:
-            return None
-
-        dcs = []
-        for t, c in zip(stamps, closes):
-            if c is None:
-                continue
-            dt = datetime.fromtimestamp(t, tz) if tz else datetime.utcfromtimestamp(t)
-            dcs.append((dt.date(), float(c)))
-        if not dcs:
-            return None
-
-        jan1 = date(year, 1, 1)
-        prior = [c for d, c in dcs if d < jan1]
-        if not prior:
-            in_year = [c for d, c in dcs if d >= jan1]
-            if not in_year:
-                return None
-            base = in_year[0]
-        else:
-            base = prior[-1]
-
-        last_vals = [c for d, c in dcs if d <= on_date]
-        if not last_vals:
-            return None
-        last_close = last_vals[-1]
-
-        if use_live_when_today and on_date == date.today():
-            try:
-                fi = yf.Ticker(symbol).fast_info
-                live = fi.get("last_price") or fi.get("regular_market_price")
-                if live is not None:
-                    last_close = float(live)
-            except Exception:
-                pass
-
-        if base == 0:
-            return None
-        return (last_close - base) / base * 100.0
-    except Exception:
-        return None
-
-# -----------------------------
-# Price-source fallback: Euronext Dublin
-# -----------------------------
-# Yahoo remains the primary source. If Yahoo returns no history for an Irish
-# .IR ticker, we make a best-effort request to Euronext's public quote page.
-# This fallback is deliberately conservative: it will only supply a CURRENT
-# price for today's run. It will never invent historical prices for an older
-# selected date. Euronext's official Web Services also supports historical
-# data, but access/configuration depends on the user's market-data agreement.
-EURONEXT_FALLBACK_ENABLED = True
-
-
-def _euronext_quote_html(url: str, timeout: float = 12.0) -> Optional[str]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Referer": "https://live.euronext.com/en/markets/dublin",
-    }
-    try:
-        if _HTTP_LIB == "requests":
-            r = requests.get(url, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.text
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except Exception:
-        return None
-
-
-def _parse_euronext_price(html: str) -> Optional[float]:
-    """Extract the current Euronext quote from the public detailed-quote HTML."""
-    if not html:
-        return None
-
-    # Preferred selector used by the current Euronext page.
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            node = soup.select_one("#header-instrument-price")
-            if node:
-                text = node.get_text(" ", strip=True)
-                # Keep digits, decimal separators and minus sign; Euronext can
-                # format prices with either comma or dot depending on locale.
-                m = re.search(r"[-+]?\d[\d\\s.,]*", text)
-                if m:
-                    raw = m.group(0).replace(" ", "")
-                    if raw.count(",") == 1 and raw.count(".") == 0:
-                        raw = raw.replace(",", ".")
-                    elif raw.count(",") > 0 and raw.count(".") > 0:
-                        # Assume the final separator is the decimal separator.
-                        if raw.rfind(",") > raw.rfind("."):
-                            raw = raw.replace(".", "").replace(",", ".")
-                        else:
-                            raw = raw.replace(",", "")
-                    return float(raw)
-        except Exception:
-            pass
-
-    # Regex fallback if BeautifulSoup is not installed.
-    try:
-        m = re.search(
-            r'id=["\']header-instrument-price["\'][^>]*>(.*?)</',
-            html,
-            flags=re.I | re.S,
-        )
-        if m:
-            text = re.sub(r"<[^>]+>", " ", m.group(1))
-            text = re.sub(r"\s+", " ", text).strip()
-            m2 = re.search(r"[-+]?\d[\d\s.,]*", text)
-            if m2:
-                raw = m2.group(0).replace(" ", "")
-                if raw.count(",") == 1 and raw.count(".") == 0:
-                    raw = raw.replace(",", ".")
-                return float(raw)
-    except Exception:
-        pass
-    return None
-
-
-def _euronext_find_instrument_url(ticker: str) -> Optional[str]:
-    """Find an Euronext Dublin equity URL for a ticker when possible.
-
-    The search page is used instead of hard-coding ISINs. This means new
-    securities can work without adding another mapping to the application.
-    """
-    base = "https://live.euronext.com/en/search_instruments/"
-    variants = [ticker, ticker.upper(), ticker.replace(".IR", "")]
-    for q in variants:
-        try:
-            if _HTTP_LIB == "requests":
-                r = requests.get(
-                    base,
-                    params={"query": q},
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=12,
-                )
-                r.raise_for_status()
-                html = r.text
-            else:
-                url = base + "?" + urllib.parse.urlencode({"query": q})
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    html = resp.read().decode("utf-8", errors="replace")
-
-            # Only accept Dublin equity instrument links. We deliberately do
-            # not accept another Euronext venue just because the ticker matches.
-            matches = re.findall(
-                r'href=["\']([^"\']*/product/equities/[^"\']+-XDUB)["\']',
-                html,
-                flags=re.I,
-            )
-            if matches:
-                # De-duplicate while preserving order.
-                seen = set()
-                for u in matches:
-                    if u in seen:
-                        continue
-                    seen.add(u)
-                    return "https://live.euronext.com" + u if u.startswith("/") else u
-        except Exception:
-            continue
-    return None
-
-
-def euronext_current_price(ticker: str) -> Optional[float]:
-    """Return today's Euronext Dublin price, or None if it cannot be resolved."""
-    if not EURONEXT_FALLBACK_ENABLED or not ticker.upper().endswith(".IR"):
-        return None
-
-    instrument_url = _euronext_find_instrument_url(ticker)
-    if not instrument_url:
-        return None
-
-    # The public detailed-quote endpoint is the same source used by the
-    # Euronext Live pages. It accepts an ISIN-MIC instrument identifier.
-    identifier = instrument_url.rstrip("/").split("/product/equities/")[-1]
-    quote_url = f"https://live.euronext.com/en/ajax/getDetailedQuote/{identifier}"
-    html = _euronext_quote_html(quote_url)
-    price = _parse_euronext_price(html) if html else None
-    return price
-
-
-def download_history_with_fallback(ticker: str, start, end, target_date: Optional[date] = None):
-    """Primary Yahoo history with a conservative Euronext current-price fallback.
-
-    Returns (DataFrame, source). The returned DataFrame has the same Close/
-    Adj Close columns expected by the rest of the application.
-    """
-    hist = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        progress=False,
-        auto_adjust=False,
-    )
-    if hist is not None and not hist.empty:
-        return hist, "Yahoo/yfinance"
-
-    # Only use Euronext for an Irish ticker and only for a current-date run.
-    # Historical backfills must not be fabricated from today's quote.
-    if ticker.upper().endswith(".IR") and (target_date is None or target_date == date.today()):
-        px = euronext_current_price(ticker)
-        if px is not None:
-            idx = pd.DatetimeIndex([pd.Timestamp(date.today())])
-            fallback = pd.DataFrame(
-                {"Open": [px], "High": [px], "Low": [px], "Close": [px], "Adj Close": [px], "Volume": [np.nan]},
-                index=idx,
-            )
-            return fallback, "Euronext Live fallback"
-
-    return hist, None
-
-# -----------------------------
-# OFFICIAL EXCHANGE CALENDAR helpers (Option B)
-# -----------------------------
-CAL_BY_SUFFIX = {
-    "IR": "XDUB",
-    "PA": "XPAR",
-    "AS": "XAMS",
-    "BR": "XBRU",
-    "LS": "XLIS",
-    "L":  "XLON",
-    "MC": "XMAD",
-    "CO": "XCSE",
-    "SW": "XSWX",
-    "DE": "XETR",
-    "F":  "XFRA",
-    "MI": "XMIL",
-}
-def _suffix(sym: str) -> str:
-    return sym.split(".")[-1].upper() if "." in sym else ""
-def ticker_calendar_code(ticker: str) -> Optional[str]:
-    return CAL_BY_SUFFIX.get(_suffix(ticker))
-def official_prev_year_last_session(ticker: str, year: int) -> Optional[date]:
-    if not _HAS_XCALS:
-        return None
-    cal_code = ticker_calendar_code(ticker)
-    if not cal_code:
-        return None
-    try:
-        cal = xcals.get_calendar(cal_code)
-        sched = cal.schedule(start=f"{year-1}-12-01", end=f"{year}-01-10")
-        idx = sched.index
-        if len(idx) == 0:
-            return None
-        prev = idx[idx.date < date(year, 1, 1)]
-        return prev[-1].date() if len(prev) else None
-    except Exception:
-        return None
-def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_price_return: bool) -> Optional[float]:
-    if hist is None or hist.empty:
-        return None
-    dates = _session_dates_index(hist)
-    mask = dates <= session_date
-    if not mask.any():
-        return None
-    pos = np.where(mask)[0][-1]
-    try:
-        col_name = _col(use_price_return)
-        value = hist.iloc[pos][col_name]
-        if isinstance(value, pd.Series):
-            value = value.iloc[0]
-        return float(value)
-    except Exception:
-        return None
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Stock Dashboard", layout="wide")
-st.title("📊 Stock Dashboard")
-st.caption("Yahoo/yfinance remains the primary price source. Irish .IR tickers now have a conservative Euronext Live fallback when Yahoo returns no history. YTD can use official exchange calendars (Europe) or Yahoo’s chart feed. Manual baselines override when provided. Data persisted to your GitHub repo.")
-
-# Debug toggle + helper
-DEBUG_MODE = st.sidebar.toggle("Show debug info", value=False)
-
-_debug_box = None
-if DEBUG_MODE:
-    _debug_box = st.sidebar.expander("Debug output", expanded=True)
-
-def debug(msg):
-    if DEBUG_MODE:
-        if _debug_box is not None:
-            _debug_box.write(msg)
-        else:
-            st.write(msg)
-
-# Always-visible GitHub Sync in the sidebar
-def _gh_config_ok():
-    hdr = _gh_headers()
-    repo, branch = _gh_repo()
-    return bool(hdr and repo), (repo or "not set"), (branch or "main")
-
-ok_cfg, repo_name, branch_name = _gh_config_ok()
-with st.sidebar:
-    st.subheader("🔗 GitHub Sync")
-    st.caption(f"Repo: {repo_name}\nBranch: {branch_name}")
-    if ok_cfg:
-        if st.button("↗️ Push data to GitHub now", key="push_sidebar"):
-            ok,msg = sync_db_to_github("manual push")
-            st.success(msg) if ok else st.warning(msg)
-        if st.button("⬇️ Pull latest from GitHub", key="pull_sidebar"):
-            seed_db_from_github()
-            st.success("Pulled latest from repo.")
-            st.rerun()
-        if st.button("🔎 Test GitHub token", key="test_token"):
-            for scheme in ("token", "bearer"):
-                hdrs = _gh_headers_auth(scheme)
-                try:
-                    if _HTTP_LIB == "requests":
-                        r = requests.get("https://api.github.com/user", headers=hdrs, timeout=10)
-                        code = r.status_code
-                        body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
-                    else:
-                        req = urllib.request.Request("https://api.github.com/user", headers=hdrs)
-                        with urllib.request.urlopen(req, timeout=10) as resp:
-                            code = resp.getcode()
-                            body = json.loads(resp.read().decode("utf-8"))
-                    if code == 200:
-                        login = body.get("login") if isinstance(body, dict) else body
-                        scopes = r.headers.get("X-OAuth-Scopes","") if _HTTP_LIB=="requests" else "(n/a)"
-                        st.success(f"Authenticated as **{login}** using **{scheme}**. Scopes: {scopes}")
-                        break
-                    elif code == 401:
-                        st.warning(f"401 with {scheme} auth — trying alternate…")
-                        continue
-                    else:
-                        st.error(f"/user returned {code}: {str(body)[:200]}")
-                        break
-                except Exception as e:
-                    st.error(f"Token test error: {e}")
-    else:
-        st.warning("Set GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH in st.secrets.")
-
-# Toggles
-use_price_return = st.toggle(
-    "Match Yahoo style for returns (use Close; live price if today)",
-    value=True,
-    help="ON = price return (Close). OFF = total return (Adj Close). Live price used for today's numerator."
-)
-exact_yahoo_mode = st.toggle(
-    "Exact Yahoo YTD (chart feed)",
-    value=True,
-    help="ON = compute YTD from Yahoo's chart endpoint to match their baseline/calendar."
-)
-use_manual_baselines = st.toggle(
-    "Use manual YTD baselines when available",
-    value=True,
-    help="If a manual baseline exists for (ticker, year), it overrides the automatic YTD baseline."
-)
-use_official_calendars = st.toggle(
-    "Use official exchange calendars for YTD baseline (Europe)",
-    value=True,
-    help="Baseline = last official session < Jan 1 per venue (XDUB/XPAR/XAMS/XMAD/XCSE/XSWX)."
-)
-round_two_dp = st.toggle(
-    "Round to 2 decimal places (off = 1 dp)",
-    value=False,
-    help="Switch between rounding numbers to 1 or 2 decimal places across Price and % columns."
-)
-DP = 2 if round_two_dp else 1
-price_fmt = f"{{:.{DP}f}}"
-pct_fmt   = f"{{:.{DP}f}}"
-
-show_indices = st.toggle(
-    "Show index 5-day trends (ISEQ, FTSE 100, S&P 500, DAX)",
-    value=True
-)
-show_index_charts = st.checkbox(
-    "Mini charts for indices (last ~10 sessions)",
-    value=False
-)
-
-init_db_with_defaults()
-if _gh_headers() and _gh_repo()[0]:
-    seed_db_from_github()
-    st.info("🔗 Seeded data from GitHub (if files present).")
-else:
-    st.warning("GitHub sync not configured (set GITHUB_* secrets) — using local ephemeral DB.")
-
-stocks_df = db_all_stocks()
-
-colA, colB = st.columns([1,1])
-with colA:
-    selected_date = st.date_input("Select date", value=date.today())
-with colB:
-    st.write(" ")
-    run = st.button("Run")
-
-# ---------- Diagnostics: Yahoo vs yfinance (optional helper) ----------
-with st.expander("🧪 Data diagnostics (Yahoo bars vs yfinance)"):
-    tkr_test = st.text_input("Ticker to inspect", value="A5G.IR")
-    dt_test = st.date_input("Date (on/before)", value=date.today(), key="diag_date")
-    if st.button("Inspect feed"):
-        dcs, meta = _yahoo_chart_series(tkr_test, max_range="3mo", interval="1d")
-        if dcs:
-            last12 = dcs[-12:]
-            st.write("Yahoo chart last 12 bar dates:", [d.isoformat() for d, _ in last12])
-            upto = [c for (d, c) in dcs if d <= dt_test]
-            st.write(f"Bars up to {dt_test.isoformat()}: {len(upto)}")
-            st.write("Yahoo 5D % (if available):", yahoo_pct_change_n_bars(tkr_test, dt_test, 5, use_live_when_today=True))
-        else:
-            st.warning("No chart bars returned from Yahoo (after retries).")
-
-        if tkr_test.upper().endswith(".IR"):
-            ep = euronext_current_price(tkr_test)
-            st.write("Euronext current-price fallback:", ep if ep is not None else "No quote returned")
-
-        h_diag = yf.download(tkr_test, start=dt_test - timedelta(days=20), end=dt_test + timedelta(days=2), progress=False, auto_adjust=False)
-        if not h_diag.empty:
-            st.write("yfinance last 12 index dates:", [pd.to_datetime(x).date().isoformat() for x in h_diag.index[-12:]])
-        else:
-            st.warning("yfinance returned empty history for this window.")
-
-with st.expander("➕ Add or ➖ remove stocks (Git-backed)"):
-    c1, c2 = st.columns([1.2, 1])
-    with c1:
-        st.markdown("**Add a stock**")
-        a_ticker = st.text_input("Ticker (e.g., AAPL, ORSTED.CO)")
-        a_name   = st.text_input("Company name")
-        a_region = st.selectbox("Region", ["Ireland", "UK", "Europe", "US"])
-        a_curr   = st.selectbox("Currency", ["EUR", "GBp", "USD", "DKK", "CHF"])
-        if st.button("Add / Update"):
-            if a_ticker and a_name:
-                db_add_stock(a_ticker, a_name, a_region, a_curr)
-                st.success(f"Saved {a_name} ({a_ticker})")
-                ok,msg = sync_db_to_github("add/update stock")
-                st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-                st.rerun()
-            else:
-                st.warning("Please provide at least Ticker and Company name.")
-    with c2:
-        st.markdown("**Remove stocks**")
-        rem_choices = [f"{r['name']} ({r['ticker']})" for _, r in stocks_df.sort_values("name").iterrows()]
-        rem_sel = st.multiselect("Select to remove", rem_choices, [])
-        if st.button("Remove selected"):
-            tickers = [s[s.rfind("(")+1:-1] for s in rem_sel]
-            db_remove_stocks(tickers)
-            st.success(f"Removed {len(tickers)} stock(s)")
-            ok,msg = sync_db_to_github("remove stocks")
-            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-            st.rerun()
-
-    st.markdown("---")
-    st.markdown("**Export / import stock list**")
-    try:
-        stocks_now = db_all_stocks().sort_values("name")
-        out = io.StringIO()
-        stocks_now.to_csv(out, index=False)
-        st.download_button("⬇️ Download stocks CSV", out.getvalue(), "stocks.csv", "text/csv")
-    except Exception as e:
-        st.warning(f"Could not export stocks: {e}")
-
-    up_stocks = st.file_uploader("Upload stocks CSV", type=["csv"], key="stocks_csv")
-    if up_stocks is not None:
-        try:
-            df_imp = pd.read_csv(up_stocks, encoding="utf-8-sig", keep_default_na=False)
-            cols = {c.strip().lower(): c for c in df_imp.columns}
-            required = {"ticker","name","region","currency"}
-            if not required.issubset(set(cols.keys())):
-                st.error("CSV must include columns: ticker, name, region, currency")
-            else:
-                tcol, ncol, rcol, ccol = cols["ticker"], cols["name"], cols["region"], cols["currency"]
-                count = 0
-                for _, r in df_imp.iterrows():
-                    t = str(r[tcol]).strip()
-                    n = str(r[ncol]).strip()
-                    rg = str(r[rcol]).strip()
-                    cu = str(r[ccol]).strip()
-                    if t and n and rg and cu:
-                        db_add_stock(t, n, rg, cu)
-                        count += 1
-                st.success(f"Imported/updated {count} stock(s).")
-                ok,msg = sync_db_to_github("stocks import")
-                st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-                st.rerun()
-        except Exception as e:
-            st.exception(e)
-
-with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of year)"):
-    cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
-    st.caption("Each row defines the baseline price used for YTD % for that ticker in this year. Price should match the series you want to mirror (Yahoo typically uses Close).")
-
-    c1, c2, c3, c4 = st.columns([1.2, 0.8, 0.8, 1])
-    with c1:
-        b_ticker = st.text_input("Ticker (exact)", placeholder="A5G.IR")
-    with c2:
-        b_price = st.text_input("Baseline price", placeholder="e.g. 4.25")
-    with c3:
-        b_series = st.selectbox("Series", ["close","adjclose"])
-    with c4:
-        b_date = st.text_input("Baseline date (optional, yyyy-mm-dd)", placeholder="2024-12-27")
-
-    b_notes = st.text_input("Notes (optional)", placeholder="e.g. Dec 27 close from Yahoo")
-    if st.button("Add / Update baseline"):
-        try:
-            price_val = float(b_price)
-            db_set_reference(b_ticker, int(cur_year), price_val, b_date.strip() or None, b_series, b_notes.strip() or None)
-            st.success(f"Baseline saved for {b_ticker} ({cur_year}): {price_val}")
-            ok,msg = sync_db_to_github("baseline upsert")
-            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-        except Exception as e:
-            st.error(f"Could not save baseline: {e}")
-
-    st.markdown("**Bulk import / export**")
-    st.caption("Accepted: CSV or Excel. Columns: ticker, year, price, date (optional), series (close|adjclose, optional), notes (optional)")
-
-    def _read_baseline_upload(upfile) -> pd.DataFrame:
-        name = upfile.name.lower()
-        if name.endswith((".xlsx", ".xls")):
-            return pd.read_excel(upfile)
-        upfile.seek(0)
-        raw = upfile.read()
-        text = raw.decode("utf-8-sig", errors="ignore")
-        import csv as _csv
-        try:
-            dialect = _csv.Sniffer().sniff(text[:10000])
-            sep = dialect.delimiter
-        except Exception:
-            sep = ","
-        from io import StringIO
-        return pd.read_csv(StringIO(text), sep=sep, keep_default_na=False)
-
-    up = st.file_uploader("Upload baselines file (CSV or Excel)", type=["csv","xlsx","xls"])
-    if up is not None:
-        try:
-            df_imp = _read_baseline_upload(up)
-            cols_norm = {c: c.strip().lower() for c in df_imp.columns}
-            inv = {v: k for k, v in cols_norm.items()}
-            price_key = next((k for k in ["price","baseline","baseline_price"] if k in inv), None)
-            if price_key is None or not {"ticker","year"}.issubset(set(inv)):
-                st.error("File must include at least: ticker, year, price (or baseline/baseline_price)")
-            else:
-                tick = df_imp[inv["ticker"]].astype(str).str.strip()
-                yr   = pd.to_numeric(df_imp[inv["year"]], errors="coerce").astype("Int64")
-                pr   = pd.to_numeric(df_imp[price_key], errors="coerce")
-                dt   = df_imp[inv["date"]]   if "date"   in inv else ""
-                ser  = df_imp[inv["series"]] if "series" in inv else ""
-                nts  = df_imp[inv["notes"]]  if "notes"  in inv else ""
-
-                norm = pd.DataFrame({
-                    "ticker": tick,
-                    "year": yr,
-                    "price": pr,
-                    "date": dt,
-                    "series": ser,
-                    "notes": nts,
-                })
-
-                bad = norm[norm[["ticker","year","price"]].isna().any(axis=1) | (norm["ticker"] == "")]
-                if not bad.empty:
-                    st.warning(f"Dropped {len(bad)} invalid row(s) (missing ticker/year/price).")
-
-                norm = norm[(norm["ticker"] != "") & norm["year"].notna() & norm["price"].notna()]
-                okcnt = 0
-                for _, r in norm.iterrows():
-                    db_set_reference(
-                        r["ticker"], int(r["year"]), float(r["price"]),
-                        (None if pd.isna(r["date"]) or str(r["date"]).strip()=="" else str(r["date"])),
-                        (None if pd.isna(r["series"]) or str(r["series"]).strip()=="" else str(r["series"])),
-                        (None if pd.isna(r["notes"]) or str(r["notes"]).strip()=="" else str(r["notes"]))
-                    )
-                    okcnt += 1
-                st.success(f"Imported/updated {okcnt} baseline(s).")
-                if okcnt > 0:
-                    ok,msg = sync_db_to_github("baseline import")
-                    st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-        except Exception as e:
-            st.exception(e)
-
-    refs_df = db_all_references(cur_year).sort_values(["ticker","year"])
-    st.dataframe(refs_df, use_container_width=True)
-    if not refs_df.empty:
-        out_csv = io.StringIO()
-        refs_df.to_csv(out_csv, index=False)
-        st.download_button("⬇️ Download current year's baselines CSV", data=out_csv.getvalue(), file_name=f"ytd_baselines_{cur_year}.csv", mime="text/csv")
-
-    if not refs_df.empty:
-        del_opts = [f"{r['ticker']} ({r['year']})" for _, r in refs_df.iterrows()]
-        del_sel = st.multiselect("Delete baselines", del_opts, [])
-        if st.button("Delete selected baselines"):
-            keys = []
-            for s_ in del_sel:
-                t = s_[:s_.rfind("(")].strip()
-                y = int(s_[s_.rfind("(")+1:-1])
-                keys.append((t,y))
-            db_delete_references(keys)
-            st.success(f"Deleted {len(keys)} baseline(s).")
-            ok,msg = sync_db_to_github("baseline delete")
-            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
-            st.rerun()
-
-stocks_df = db_all_stocks()
-stock_options = {f"{r['name']} ({r['ticker']})": dict(r) for _, r in stocks_df.iterrows()}
-sel_labels = st.multiselect(
-    "Stocks to include in this run:",
-    list(stock_options.keys()),
-    default=list(stock_options.keys())
-)
-selected_stocks = [stock_options[label] for label in sel_labels]
-
-# -----------------------------
-# Run calculation
-# -----------------------------
-if run:
-    rows = []
-    target_dt = pd.to_datetime(selected_date)
-    target_date = target_dt.date()
-    today_date = date.today()
-    
-    debug(f"**DEBUG: target_date = {target_date}, today = {today_date}**")
-    debug(f"**Selected {len(selected_stocks)} stocks**")
-
-    # --------- Stocks ----------
-    for s in selected_stocks:
-        tkr = s["ticker"]
-        debug(f"**Processing {tkr}...**")
-        try:
-            hist, price_source = download_history_with_fallback(
-                tkr,
-                start=f"{selected_date.year-1}-12-15",
-                end=selected_date + timedelta(days=7),
-                target_date=target_date,
-            )
-            debug(f"price source: {price_source or 'none'}")
-            debug(f"yfinance/Euronext returned {len(hist) if hist is not None else 0} rows")
-            debug(f"hist type: {type(hist)}")
-            debug(f"hist.empty: {hist.empty if hasattr(hist, 'empty') else 'N/A'}")
-            
-            if hist is None or hist.empty:
-                debug("✗ SKIP: no price data from Yahoo or Euronext fallback")
-                continue
-
-            debug(f"hist index dates: {[str(d.date()) for d in hist.index[-5:]]}")
-            
-            price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
-            debug(f"last_close_on_or_before_date returned: price_eod={price_eod}, pos={pos}")
-            
-            if pos is None:
-                debug("✗ SKIP: pos is None")
-                continue
-            
-            debug(f"✓ SUCCESS: Have price={price_eod}, pos={pos}")
-            
-            use_live = use_price_return and (target_date == today_date)
-            live_price = None
-            if use_live:
-                try:
-                    fi = yf.Ticker(tkr).fast_info
-                    live_price = fi.get("last_price") or fi.get("regular_market_price")
-                except Exception:
-                    live_price = None
-                if live_price is None and price_source == "Euronext Live fallback":
-                    live_price = euronext_current_price(tkr)
-
-            price_num = float(live_price) if (live_price is not None) else float(price_eod)
-            debug(f"✓ SUCCESS: Have price={price_num}, pos={pos}, source={price_source}")
-
-            # 5D is strictly a completed-session close-to-close calculation.
-            # Use the same daily history already downloaded for this security.
-            # Do NOT use fast_info/live price or the Yahoo chart endpoint here.
-            #
-            # If the selected date is a weekend/holiday, last_close_on_or_before_date
-            # resolves it to the latest completed exchange session. We then move
-            # back exactly five rows/sessions in that same series.
-            chg_5d = close_to_close_pct_change_n_trading_sessions(
-                hist, target_date, 5, use_price_return=True
-            )
-            debug(f"5D close-to-close result: {chg_5d}")
-
-            manual_used = False
-            chg_ytd = None
-
-            manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
-            if manual_ref is not None:
-                base = float(manual_ref["price"])
-                chg_ytd = (price_num - base) / base * 100.0
-                manual_used = True
-            else:
-                base_val = None
-                if use_official_calendars and _HAS_XCALS:
-                    baseline_session = official_prev_year_last_session(tkr, selected_date.year)
-                    if baseline_session is not None:
-                        base_val = baseline_from_hist_on_or_before(hist, baseline_session, use_price_return)
-                if base_val is not None and base_val != 0:
-                    chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
-                else:
-                    if exact_yahoo_mode:
-                        chg_ytd = yahoo_ytd_via_chart(tkr, selected_date.year, target_date, use_live_when_today=use_price_return)
-                    else:
-                        dates = _session_dates_index(hist)
-                        mask_prev = dates <= date(selected_date.year - 1, 12, 31)
-                        base_fallback = float(hist.iloc[np.where(mask_prev)[0][-1]][_col(use_price_return)]) if mask_prev.any() else None
-                        chg_ytd = ((price_num - base_fallback) / base_fallback * 100.0) if base_fallback else None
-
-            rows.append({
-                "Company": s["name"],
-                "Manual": "🧭" if manual_used else "",
-                "Region": s["region"],
-                "Currency": s["currency"],
-                "Price": round(price_num, DP),
-                "5D % Change": round(chg_5d, DP) if chg_5d is not None else None,
-                "YTD % Change": round(chg_ytd, DP) if chg_ytd is not None else None,
-            })
-        except Exception as e:
-            debug(f"✗ ERROR: {type(e).__name__}: {e}")
-            continue
-
-    # --------- Indices ----------
-    if show_indices:
-        idx_defs = [
-            {"name": "ISEQ All-Share", "ticker": "^ISEQ"},
-            {"name": "FTSE 100",       "ticker": "^FTSE"},
-            {"name": "S&P 500",        "ticker": "^GSPC"},
-            {"name": "DAX",            "ticker": "^GDAXI"},
-        ]
-        chart_cols = st.columns(len(idx_defs)) if show_index_charts else None
-        idx_rows = []
-        for i, info in enumerate(idx_defs):
-            try:
-                h = yf.download(
-                    info["ticker"],
-                    start=selected_date - timedelta(days=30),
-                    end=selected_date + timedelta(days=7),
-                    progress=False,
-                    auto_adjust=False,
-                )
-                if h is None or h.empty:
-                    continue
-
-                last_lvl, pos_lvl = last_close_on_or_before_date(h, target_date, use_price_return=True)
-                if pos_lvl is None:
-                    continue
-
-                # Index 5D is also strictly close-to-close. The "Exact Yahoo
-                # YTD" toggle must not change this calculation.
-                chg_5d_idx = yahoo_close_to_close_pct_change_n_trading_sessions(
-                    info["ticker"], target_date, 5
-                )
-
-                idx_rows.append({
-                    "Index": info["name"],
-                    "Level": round(last_lvl, DP),
-                    "5D % Change": round(chg_5d_idx, DP) if chg_5d_idx is not None else None,
-                })
-
-                if show_index_charts:
-                    series = h["Close"].dropna().tail(10)
-                    with chart_cols[i]:
-                        st.caption(info["name"])
-                        st.line_chart(series)
-            except Exception:
-                continue
-
-        if idx_rows:
-            st.subheader("Major indices — 5-day trend")
-            st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
-
-    # --------- Stocks table / CSV ----------
-    if not rows:
-        st.warning("No stock data available for that date.")
-    else:
-        df = (
-            pd.DataFrame(rows)
-              .sort_values(by=["Region", "Company"])
-              .reset_index(drop=True)
-        )
-
-        region_order = ["Ireland", "UK", "Europe", "US"]
-        df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
-        df = df.sort_values(["Region", "Company"])
-
-        display_cols = ["Company","Manual","Price","5D % Change","YTD % Change"]
-
-        for region in region_order:
-            g = df[df["Region"] == region]
-            if g.empty:
-                continue
-            currs = g["Currency"].unique().tolist()
-            curr_label = " / ".join(currency_symbol(c) for c in currs if currency_symbol(c))
-            header = f"{region} ({curr_label})" if curr_label else region
-            st.subheader(header)
-            st.dataframe(g[display_cols], use_container_width=True)
-
-        REGION_LABELS = {
-            "Ireland": f"Ireland ({currency_symbol('EUR')})",
-            "UK":      f"UK (GBX)",
-            "Europe":  f"Europe ({currency_symbol('EUR')})",
-            "US":      f"US ({currency_symbol('USD')})",
-        }
-
-        output = io.StringIO()
-        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-
-        for region in region_order:
-            g = df[df["Region"] == region]
-            if g.empty:
-                continue
-            writer.writerow([REGION_LABELS[region], "Last price", "5D % change", "YTD % change"])
-            for _, row in g.iterrows():
-                company = (row["Company"] or "").replace(",", "")
-                price = (price_fmt.format(row['Price'])) if pd.notnull(row["Price"]) else ""
-                c5 = (pct_fmt.format(row['5D % Change'])) if pd.notnull(row["5D % Change"]) else ""
-                cy = (pct_fmt.format(row['YTD % Change'])) if pd.notnull(row['YTD % Change']) else ""
-                writer.writerow([company, price, c5, cy])
-
-        csv_bytes = "\ufeff" + output.getvalue()
-        st.download_button("💾 Download CSV", csv_bytes, "stock_data.csv", "text/csv")
+DEBUG: target_date = 2026-09-12, today = 2026-09-12
+
+Selected 70 stocks
+
+Processing A5G.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=11.645000457763672, pos=186
+
+✓ SUCCESS: Have price=11.645000457763672, pos=186
+
+✓ SUCCESS: Have price=11.645000457763672, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 2.508809944539975
+
+Processing ABBV...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=257.1199951171875, pos=185
+
+✓ SUCCESS: Have price=257.1199951171875, pos=185
+
+✓ SUCCESS: Have price=257.1199951171875, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -1.187501033535091
+
+Processing ABT...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=101.94999694824219, pos=185
+
+✓ SUCCESS: Have price=101.94999694824219, pos=185
+
+✓ SUCCESS: Have price=101.94999694824219, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -6.287346180460321
+
+Processing AER...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=141.5, pos=185
+
+✓ SUCCESS: Have price=141.5, pos=185
+
+✓ SUCCESS: Have price=141.5, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -3.399778722551393
+
+Processing GOOG...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=335.45001220703125, pos=185
+
+✓ SUCCESS: Have price=335.45001220703125, pos=185
+
+✓ SUCCESS: Have price=335.45001220703125, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -1.0705363067662932
+
+Processing AMGN...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=377.3500061035156, pos=185
+
+✓ SUCCESS: Have price=377.3500061035156, pos=185
+
+✓ SUCCESS: Have price=377.3500061035156, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -15.03422267580041
+
+Processing ADI...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=378.7799987792969, pos=185
+
+✓ SUCCESS: Have price=378.7799987792969, pos=185
+
+✓ SUCCESS: Have price=378.7799987792969, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 6.2496490264507365
+
+Processing AAPL...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=332.2699890136719, pos=185
+
+✓ SUCCESS: Have price=332.2699890136719, pos=185
+
+✓ SUCCESS: Have price=332.2699890136719, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 1.2370121764405333
+
+Processing YZA.IR...
+
+price source: none
+
+yfinance/Euronext returned 0 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: True
+
+✗ SKIP: no price data from Yahoo or Euronext fallback
+
+Processing ABF.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1843.5, pos=186
+
+✓ SUCCESS: Have price=1843.5, pos=186
+
+✓ SUCCESS: Have price=1843.5, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -11.027992277992277
+
+Processing BIRG.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=20.3700008392334, pos=186
+
+✓ SUCCESS: Have price=20.3700008392334, pos=186
+
+✓ SUCCESS: Have price=20.3700008392334, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 2.4905702602938287
+
+Processing BKT.MC...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 188 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=16.93000030517578, pos=187
+
+✓ SUCCESS: Have price=16.93000030517578, pos=187
+
+✓ SUCCESS: Have price=16.93000030517578, pos=187, source=Yahoo/yfinance
+
+5D close-to-close result: 0.11827591924391842
+
+Processing BSX...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=42.97999954223633, pos=185
+
+✓ SUCCESS: Have price=42.97999954223633, pos=185
+
+✓ SUCCESS: Have price=42.97999954223633, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -8.455806509457808
+
+Processing BMY...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=63.63999938964844, pos=185
+
+✓ SUCCESS: Have price=63.63999938964844, pos=185
+
+✓ SUCCESS: Have price=63.63999938964844, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -6.5354636328066
+
+Processing BRBY.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1018.0, pos=186
+
+✓ SUCCESS: Have price=1018.0, pos=186
+
+✓ SUCCESS: Have price=1018.0, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -7.748074309016764
+
+Processing CRH...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=88.55000305175781, pos=185
+
+✓ SUCCESS: Have price=88.55000305175781, pos=185
+
+✓ SUCCESS: Have price=88.55000305175781, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -3.7918272805892177
+
+Processing C5H.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=2.7249999046325684, pos=186
+
+✓ SUCCESS: Have price=2.7249999046325684, pos=186
+
+✓ SUCCESS: Have price=2.7249999046325684, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -2.6785731771771086
+
+Processing COKE...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=192.61000061035156, pos=185
+
+✓ SUCCESS: Have price=192.61000061035156, pos=185
+
+✓ SUCCESS: Have price=192.61000061035156, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.4265417599985653
+
+Processing DCC.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=6330.0, pos=186
+
+✓ SUCCESS: Have price=6330.0, pos=186
+
+✓ SUCCESS: Have price=6330.0, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -0.07892659826361484
+
+Processing DHG.IR...
+
+price source: none
+
+yfinance/Euronext returned 0 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: True
+
+✗ SKIP: no price data from Yahoo or Euronext fallback
+
+Processing BSN.F...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=61.52000045776367, pos=185
+
+✓ SUCCESS: Have price=61.52000045776367, pos=185
+
+✓ SUCCESS: Have price=61.52000045776367, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -3.2095671356995696
+
+Processing DGE.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1603.0, pos=186
+
+✓ SUCCESS: Have price=1603.0, pos=186
+
+✓ SUCCESS: Have price=1603.0, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -3.2589016294508144
+
+Processing DQ7A.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=12.5, pos=186
+
+✓ SUCCESS: Have price=12.5, pos=186
+
+✓ SUCCESS: Have price=12.5, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.0
+
+Processing LLY...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1115.699951171875, pos=185
+
+✓ SUCCESS: Have price=1115.699951171875, pos=185
+
+✓ SUCCESS: Have price=1115.699951171875, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -3.785790387920639
+
+Processing EG7.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=18.700000762939453, pos=186
+
+✓ SUCCESS: Have price=18.700000762939453, pos=186
+
+✓ SUCCESS: Have price=18.700000762939453, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -0.26666259765625
+
+Processing FLUT...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=100.55999755859375, pos=185
+
+✓ SUCCESS: Have price=100.55999755859375, pos=185
+
+✓ SUCCESS: Have price=100.55999755859375, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -1.7392992407581742
+
+Processing GE...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=323.6600036621094, pos=185
+
+✓ SUCCESS: Have price=323.6600036621094, pos=185
+
+✓ SUCCESS: Have price=323.6600036621094, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.9447064293821636
+
+Processing GL9.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=21.5, pos=186
+
+✓ SUCCESS: Have price=21.5, pos=186
+
+✓ SUCCESS: Have price=21.5, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -3.1531564814539568
+
+Processing GVR.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=2.3550000190734863, pos=186
+
+✓ SUCCESS: Have price=2.3550000190734863, pos=186
+
+✓ SUCCESS: Have price=2.3550000190734863, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -4.655870777517727
+
+Processing GFTU.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=954.0999755859375, pos=186
+
+✓ SUCCESS: Have price=954.0999755859375, pos=186
+
+✓ SUCCESS: Have price=954.0999755859375, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -5.272044874655837
+
+Processing GWMO.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=3.6500000953674316, pos=186
+
+✓ SUCCESS: Have price=3.6500000953674316, pos=186
+
+✓ SUCCESS: Have price=3.6500000953674316, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 4.285717010498047
+
+Processing GRP.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=0.7710000276565552, pos=186
+
+✓ SUCCESS: Have price=0.7710000276565552, pos=186
+
+✓ SUCCESS: Have price=0.7710000276565552, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.0
+
+Processing GNC.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=248.60000610351562, pos=186
+
+✓ SUCCESS: Have price=248.60000610351562, pos=186
+
+✓ SUCCESS: Have price=248.60000610351562, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -2.5862033399887245
+
+Processing HPQ...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=35.47999954223633, pos=185
+
+✓ SUCCESS: Have price=35.47999954223633, pos=185
+
+✓ SUCCESS: Have price=35.47999954223633, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 11.118068284155639
+
+Processing HEIA.AS...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 188 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=70.27999877929688, pos=187
+
+✓ SUCCESS: Have price=70.27999877929688, pos=187
+
+✓ SUCCESS: Have price=70.27999877929688, pos=187, source=Yahoo/yfinance
+
+5D close-to-close result: -3.381907006761045
+
+Processing HSW.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1.399999976158142, pos=186
+
+✓ SUCCESS: Have price=1.399999976158142, pos=186
+
+✓ SUCCESS: Have price=1.399999976158142, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.0
+
+Processing IBE.MC...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 188 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=20.15999984741211, pos=187
+
+✓ SUCCESS: Have price=20.15999984741211, pos=187
+
+✓ SUCCESS: Have price=20.15999984741211, pos=187, source=Yahoo/yfinance
+
+5D close-to-close result: 2.075948594491693
+
+Processing ICON...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=0.9200000166893005, pos=185
+
+✓ SUCCESS: Have price=0.9200000166893005, pos=185
+
+✓ SUCCESS: Have price=0.9200000166893005, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -5.252317015431587
+
+Processing INTC...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=102.94000244140625, pos=185
+
+✓ SUCCESS: Have price=102.94000244140625, pos=185
+
+✓ SUCCESS: Have price=102.94000244140625, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 12.294103302686475
+
+Processing IRES.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=1.0720000267028809, pos=186
+
+✓ SUCCESS: Have price=1.0720000267028809, pos=186
+
+✓ SUCCESS: Have price=1.0720000267028809, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -0.5565791311411724
+
+Processing IR5B.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=7.920000076293945, pos=186
+
+✓ SUCCESS: Have price=7.920000076293945, pos=186
+
+✓ SUCCESS: Have price=7.920000076293945, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 6.166220318964427
+
+Processing JNJ...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=265.5799865722656, pos=185
+
+✓ SUCCESS: Have price=265.5799865722656, pos=185
+
+✓ SUCCESS: Have price=265.5799865722656, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -4.615165909399301
+
+Processing KMR.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=2.140000104904175, pos=186
+
+✓ SUCCESS: Have price=2.140000104904175, pos=186
+
+✓ SUCCESS: Have price=2.140000104904175, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -7.758613513709325
+
+Processing KRZ.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=83.5, pos=186
+
+✓ SUCCESS: Have price=83.5, pos=186
+
+✓ SUCCESS: Have price=83.5, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -0.8902077151335311
+
+Processing KRX.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=102.5, pos=186
+
+✓ SUCCESS: Have price=102.5, pos=186
+
+✓ SUCCESS: Have price=102.5, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.2935450691938327
+
+Processing MLC.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=7.0, pos=186
+
+✓ SUCCESS: Have price=7.0, pos=186
+
+✓ SUCCESS: Have price=7.0, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.0
+
+Processing MRK...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=143.92999267578125, pos=185
+
+✓ SUCCESS: Have price=143.92999267578125, pos=185
+
+✓ SUCCESS: Have price=143.92999267578125, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -5.520548683391037
+
+Processing META...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=648.030029296875, pos=185
+
+✓ SUCCESS: Have price=648.030029296875, pos=185
+
+✓ SUCCESS: Have price=648.030029296875, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 6.116138905654867
+
+Processing MSFT...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=495.6300048828125, pos=185
+
+✓ SUCCESS: Have price=495.6300048828125, pos=185
+
+✓ SUCCESS: Have price=495.6300048828125, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.840506228548497
+
+Processing NVS...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=137.16000366210938, pos=185
+
+✓ SUCCESS: Have price=137.16000366210938, pos=185
+
+✓ SUCCESS: Have price=137.16000366210938, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -15.89919262862657
+
+Processing ORCL...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=150.27999877929688, pos=185
+
+✓ SUCCESS: Have price=150.27999877929688, pos=185
+
+✓ SUCCESS: Have price=150.27999877929688, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.4409209755363084
+
+Processing OIZ.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=4.28000020980835, pos=186
+
+✓ SUCCESS: Have price=4.28000020980835, pos=186
+
+✓ SUCCESS: Have price=4.28000020980835, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -4.035870556032749
+
+Processing ORSTED.CO...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 181 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=135.35000610351562, pos=180
+
+✓ SUCCESS: Have price=135.35000610351562, pos=180
+
+✓ SUCCESS: Have price=135.35000610351562, pos=180, source=Yahoo/yfinance
+
+5D close-to-close result: 0.2592637803819444
+
+Processing PTSB.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=2.950000047683716, pos=186
+
+✓ SUCCESS: Have price=2.950000047683716, pos=186
+
+✓ SUCCESS: Have price=2.950000047683716, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.340135723422776
+
+Processing PEP...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=136.32000732421875, pos=185
+
+✓ SUCCESS: Have price=136.32000732421875, pos=185
+
+✓ SUCCESS: Have price=136.32000732421875, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.64247738561875
+
+Processing PFE...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=27.719999313354492, pos=185
+
+✓ SUCCESS: Have price=27.719999313354492, pos=185
+
+✓ SUCCESS: Have price=27.719999313354492, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -3.7834091384709314
+
+Processing POLB.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=8.300000190734863, pos=186
+
+✓ SUCCESS: Have price=8.300000190734863, pos=186
+
+✓ SUCCESS: Have price=8.300000190734863, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: 0.6060629179983428
+
+Processing ROG.SW...
+
+price source: none
+
+yfinance/Euronext returned 0 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: True
+
+✗ SKIP: no price data from Yahoo or Euronext fallback
+
+Processing RYA.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=22.6200008392334, pos=186
+
+✓ SUCCESS: Have price=22.6200008392334, pos=186
+
+✓ SUCCESS: Have price=22.6200008392334, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -0.658759839765965
+
+Processing SSPG.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=184.8000030517578, pos=186
+
+✓ SUCCESS: Have price=184.8000030517578, pos=186
+
+✓ SUCCESS: Have price=184.8000030517578, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -5.858379939488758
+
+Processing SAN.PA...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 188 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=73.26000213623047, pos=187
+
+✓ SUCCESS: Have price=73.26000213623047, pos=187
+
+✓ SUCCESS: Have price=73.26000213623047, pos=187, source=Yahoo/yfinance
+
+5D close-to-close result: -3.946498805975195
+
+Processing SW...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=43.220001220703125, pos=185
+
+✓ SUCCESS: Have price=43.220001220703125, pos=185
+
+✓ SUCCESS: Have price=43.220001220703125, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -4.5072849679261155
+
+Processing SBUX...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=98.73999786376953, pos=185
+
+✓ SUCCESS: Have price=98.73999786376953, pos=185
+
+✓ SUCCESS: Have price=98.73999786376953, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -6.69060844025024
+
+Processing STT...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=193.39999389648438, pos=185
+
+✓ SUCCESS: Have price=193.39999389648438, pos=185
+
+✓ SUCCESS: Have price=193.39999389648438, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -0.2784410323419605
+
+Processing TSCO.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=465.3999938964844, pos=186
+
+✓ SUCCESS: Have price=465.3999938964844, pos=186
+
+✓ SUCCESS: Have price=465.3999938964844, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -2.103491823388084
+
+Processing TSLA...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=365.44000244140625, pos=185
+
+✓ SUCCESS: Have price=365.44000244140625, pos=185
+
+✓ SUCCESS: Have price=365.44000244140625, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: -2.904055269437209
+
+Processing UPR.IR...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=3.9000000953674316, pos=186
+
+✓ SUCCESS: Have price=3.9000000953674316, pos=186
+
+✓ SUCCESS: Have price=3.9000000953674316, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -6.362541870653368
+
+Processing VOD.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=128.75, pos=185
+
+✓ SUCCESS: Have price=128.75, pos=185
+
+✓ SUCCESS: Have price=128.75, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 2.5079630287797654
+
+Processing EBAY...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 186 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-04', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=107.75, pos=185
+
+✓ SUCCESS: Have price=107.75, pos=185
+
+✓ SUCCESS: Have price=107.75, pos=185, source=Yahoo/yfinance
+
+5D close-to-close result: 1.785376326045121
+
+Processing HVO.L...
+
+price source: Yahoo/yfinance
+
+yfinance/Euronext returned 187 rows
+
+hist type: <class 'pandas.DataFrame'>
+
+hist.empty: False
+
+hist index dates: ['2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', '2026-09-11']
+
+last_close_on_or_before_date returned: price_eod=6.550000190734863, pos=186
+
+✓ SUCCESS: Have price=6.550000190734863, pos=186
+
+✓ SUCCESS: Have price=6.550000190734863, pos=186, source=Yahoo/yfinance
+
+5D close-to-close result: -5.072462315870889
