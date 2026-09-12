@@ -1219,13 +1219,17 @@ if run:
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
             debug(f"✓ SUCCESS: Have price={price_num}, pos={pos}, source={price_source}")
 
-            # 5D uses Yahoo's completed daily closes only. Do NOT use fast_info
-            # or the yfinance.download dataframe for this calculation because
-            # either can contain a delayed/current quote that does not match the
-            # published daily close.
-            chg_5d = yahoo_close_to_close_pct_change_n_trading_sessions(
-                tkr, target_date, 5
+            # 5D is strictly a completed-session close-to-close calculation.
+            # Use the same daily history already downloaded for this security.
+            # Do NOT use fast_info/live price or the Yahoo chart endpoint here.
+            #
+            # If the selected date is a weekend/holiday, last_close_on_or_before_date
+            # resolves it to the latest completed exchange session. We then move
+            # back exactly five rows/sessions in that same series.
+            chg_5d = close_to_close_pct_change_n_trading_sessions(
+                hist, target_date, 5, use_price_return=True
             )
+            debug(f"5D close-to-close result: {chg_5d}")
 
             manual_used = False
             chg_ytd = None
