@@ -519,6 +519,27 @@ def close_to_close_pct_change_n_trading_sessions(df: pd.DataFrame, target_date: 
         return None
     return (current - base) / base * 100.0
 
+def yahoo_close_to_close_pct_change_n_trading_sessions(
+    symbol: str,
+    target_date: date,
+    n: int = 5,
+) -> Optional[float]:
+    """Calculate an n-session close-to-close return from Yahoo's chart feed."""
+    try:
+        dcs, _meta = _yahoo_chart_series(symbol, max_range="3mo", interval="1d")
+        if not dcs:
+            return None
+        sessions = [(d, c) for d, c in dcs if d <= target_date and np.isfinite(c)]
+        if len(sessions) < n + 1:
+            return None
+        _current_date, current = sessions[-1]
+        _base_date, base = sessions[-(n + 1)]
+        if base == 0:
+            return None
+        return (float(current) - float(base)) / float(base) * 100.0
+    except Exception:
+        return None
+
 def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": "2y", "interval": "1d", "includePrePost": "false", "events": "div,splits"}
@@ -1198,10 +1219,12 @@ if run:
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
             debug(f"✓ SUCCESS: Have price={price_num}, pos={pos}, source={price_source}")
 
-            # 5D uses completed daily closes only. Live/fast_info is reserved for the
-            # displayed current price, so the percentage cannot drift intraday.
-            chg_5d = close_to_close_pct_change_n_trading_sessions(
-                hist, target_date, 5, use_price_return
+            # 5D uses Yahoo's completed daily closes only. Do NOT use fast_info
+            # or the yfinance.download dataframe for this calculation because
+            # either can contain a delayed/current quote that does not match the
+            # published daily close.
+            chg_5d = yahoo_close_to_close_pct_change_n_trading_sessions(
+                tkr, target_date, 5
             )
 
             manual_used = False
@@ -1268,13 +1291,11 @@ if run:
                 if pos_lvl is None:
                     continue
 
-                chg_5d_idx = None
-                if exact_yahoo_mode:
-                    chg_5d_idx = yahoo_pct_change_n_bars(info["ticker"], target_date, 5, use_live_when_today=True)
-                if chg_5d_idx is None:
-                    lvl_5ago = close_n_trading_days_ago_by_pos(h, pos_lvl, 5, use_price_return=True)
-                    if lvl_5ago is not None and lvl_5ago != 0:
-                        chg_5d_idx = (last_lvl - lvl_5ago) / lvl_5ago * 100.0
+                # Index 5D is also strictly close-to-close. The "Exact Yahoo
+                # YTD" toggle must not change this calculation.
+                chg_5d_idx = yahoo_close_to_close_pct_change_n_trading_sessions(
+                    info["ticker"], target_date, 5
+                )
 
                 idx_rows.append({
                     "Index": info["name"],
