@@ -496,29 +496,28 @@ def _yahoo_chart_series(symbol: str, max_range: str = "3mo", interval: str = "1d
                     pass
     return None, None
 
-def yahoo_pct_change_n_bars(symbol: str, on_date: date, n_bars: int, use_live_when_today: bool = True) -> Optional[float]:
-    dcs, meta = _yahoo_chart_series(symbol, max_range="3mo", interval="1d")
-    if not dcs:
+def close_to_close_pct_change_n_trading_sessions(df: pd.DataFrame, target_date: date, n: int = 5, use_price_return: bool = True) -> Optional[float]:
+    """Return n-session change from daily closes only (never live quotes)."""
+    if df is None or df.empty or n < 1:
         return None
-
-    upto = [c for (d, c) in dcs if d <= on_date]
-    if len(upto) < (n_bars + 1):
+    dates = _session_dates_index(df)
+    valid = np.where(dates <= target_date)[0]
+    if len(valid) < n + 1:
         return None
-
-    last_close = upto[-1]
-    if use_live_when_today and on_date == date.today():
-        try:
-            fi = yf.Ticker(symbol).fast_info
-            live = fi.get("last_price") or fi.get("regular_market_price")
-            if live is not None:
-                last_close = float(live)
-        except Exception:
-            pass
-
-    base = upto[-(n_bars + 1)]
-    if not base:
+    pos = int(valid[-1])
+    base_pos = pos - n
+    col = _col(use_price_return)
+    try:
+        current = df.iloc[pos][col]
+        base = df.iloc[base_pos][col]
+        if isinstance(current, pd.Series): current = current.iloc[0]
+        if isinstance(base, pd.Series): base = base.iloc[0]
+        current, base = float(current), float(base)
+    except Exception:
         return None
-    return (last_close - base) / base * 100.0
+    if not np.isfinite(current) or not np.isfinite(base) or base == 0:
+        return None
+    return (current - base) / base * 100.0
 
 def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_today: bool = True) -> Optional[float]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -1199,13 +1198,11 @@ if run:
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
             debug(f"✓ SUCCESS: Have price={price_num}, pos={pos}, source={price_source}")
 
-            chg_5d = None
-            if exact_yahoo_mode:
-                chg_5d = yahoo_pct_change_n_bars(tkr, target_date, 5, use_live_when_today=use_price_return)
-            if chg_5d is None:
-                c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
-                if c_5ago is not None and c_5ago != 0:
-                    chg_5d = (price_num - c_5ago) / c_5ago * 100.0
+            # 5D uses completed daily closes only. Live/fast_info is reserved for the
+            # displayed current price, so the percentage cannot drift intraday.
+            chg_5d = close_to_close_pct_change_n_trading_sessions(
+                hist, target_date, 5, use_price_return
+            )
 
             manual_used = False
             chg_ytd = None
