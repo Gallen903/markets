@@ -14,7 +14,7 @@ import re
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
-try:ac
+try:
     import requests
     _HTTP_LIB = "requests"
 except Exception:
